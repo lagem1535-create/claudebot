@@ -2142,6 +2142,23 @@ impl App {
                 continue; // inner chatter of a sub-agent
             }
             match v["type"].as_str().unwrap_or("") {
+                "rate_limit_event" => {
+                    // 구독 요금제 한도 알림(상태, 초기화 시각, 가능하면 사용률)을 마지막 값만 저장해 둡니다.
+                    if v["rate_limit_info"].is_object() {
+                        let mut prev: Value = std::fs::read_to_string(self.data.join("ratelimit.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(json!({}));
+                        let mut windows = prev["windows"].as_object().cloned().unwrap_or_default();
+                        let info = &v["rate_limit_info"];
+                        if let Some(uw) = info["unifiedWindows"].as_object() {
+                            for (k, w) in uw {
+                                windows.insert(k.clone(), w.clone());
+                            }
+                        } else if let (Some(t), Some(u)) = (info["rateLimitType"].as_str(), info["utilization"].as_f64()) {
+                            windows.insert(t.to_string(), json!({"utilization": u, "resetsAt": info["resetsAt"]}));
+                        }
+                        prev = json!({"info": info, "windows": windows, "at": now()});
+                        let _ = std::fs::write(self.data.join("ratelimit.json"), prev.to_string());
+                    }
+                }
                 "system" => {
                     if let Some(model) = v["model"].as_str() {
                         self.set_agent(id, |a| a.actual_model = model.to_string());
@@ -2563,6 +2580,10 @@ fn handle(app: Arc<App>, mut req: Request) {
         return send_json(req, code, v);
     }
     match (&method, parts.as_slice()) {
+        (Method::Get, ["api", "ratelimit"]) => {
+            let v: Value = std::fs::read_to_string(app.data.join("ratelimit.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(json!({"info": null}));
+            send_json(req, 200, v)
+        }
         (Method::Get, ["api", "health"]) => send_json(req, 200, json!({
             "ok": true, "claude": app.claude.is_some(), "version": app.version, "app_version": APP_VERSION, "os": std::env::consts::OS,
             "screens": app.screens, "work": app.work.to_string_lossy(), "vnc": vnc_ok(), "vnc_port": VNC_PORT.load(std::sync::atomic::Ordering::Relaxed)

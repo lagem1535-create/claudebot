@@ -1394,6 +1394,30 @@ function openAgentSettings(a){
   render();
 }
 
+const RL_NAMES={five_hour:'5시간 한도',seven_day:'주간 한도',seven_day_opus:'주간 한도 (Opus)',seven_day_sonnet:'주간 한도 (Sonnet)',model:'모델별 한도'};
+const RL_STATUS={allowed:'정상',allowed_warning:'한도에 가까워요',rejected:'한도에 도달했어요',rate_limited:'한도에 도달했어요'};
+function rlWhen(t){
+  if(!t)return'';const ms=t>1e12?t:t*1000;const d=ms-Date.now();
+  const at=new Date(ms).toLocaleString('ko-KR',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'});
+  if(d<=0)return'초기화됨 ('+at+')';
+  const m=Math.round(d/60000),hh=Math.floor(m/60),mm=m%60,dd=Math.floor(hh/24);
+  return (dd?`${dd}일 ${hh%24}시간`:hh?`${hh}시간 ${mm}분`:`${mm}분`)+' 뒤 초기화 ('+at+')';
+}
+function rateLimitView(r){
+  if(!r||!r.info)return h('p',{class:'note'},r===undefined||r===null?'불러오는 중…':'아직 받은 값이 없어요. 에이전트에게 한 번 일을 시키면 여기에 나타나요. (구독 요금제로 로그인한 경우에만 표시됩니다. API 키 로그인에서는 나오지 않아요.)');
+  const info=r.info,rows=[];
+  const win=r.windows||{};
+  for(const k of Object.keys(win)){
+    const w=win[k]||{};let u=Number(w.utilization);const has=isFinite(u);if(has)u=u<=1?u*100:u;
+    rows.push(h('div',{class:'skl'},h('b',{},RL_NAMES[k]||k),
+      has?h('div',{style:'height:8px;border-radius:99px;background:var(--raise,#eee);overflow:hidden;margin:6px 0'},h('div',{style:`height:100%;width:${Math.min(100,Math.max(0,u)).toFixed(0)}%;background:${u>=90?'#c0392b':u>=70?'#e0a030':'var(--accent,#c8664a)'}`})):null,
+      h('span',{},(has?u.toFixed(0)+'% 사용 · ':'')+rlWhen(w.resetsAt))));
+  }
+  if(!rows.length)rows.push(h('div',{class:'skl'},h('b',{},RL_NAMES[info.rateLimitType]||info.rateLimitType||'한도'),h('span',{},rlWhen(info.resetsAt)||'')));
+  const at=r.at?new Date(r.at).toLocaleString('ko-KR',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'}):'';
+  return h('div',{},h('div',{class:'srow'},h('div',{},h('b',{},'상태')),h('b',{},RL_STATUS[info.status]||info.status||'알 수 없음')),rows,
+    h('p',{class:'note',style:'margin-top:6px'},(at?`마지막으로 받은 시각 ${at}. `:'')+'에이전트가 일할 때마다 갱신돼요. 실제 사용량은 claude.ai 설정의 "사용량"이 기준입니다.'));
+}
 const SET_TABS=[['general','일반'],['help','도움말'],['diag','진단'],['usage','사용량'],['code','Claude Code'],['skills','Skills'],['mcp','커넥터'],['plugins','플러그인'],['chars','캐릭터'],['bk','백업'],['git','GitHub'],['pc','내 컴퓨터'],['upd','업데이트'],['lg','브라우저 로그인']];
 S.setTab='general';S.cc=null;
 function openSettings(tab){
@@ -1419,12 +1443,14 @@ function openSettings(tab){
   }else if(S.setTab==='usage'){
     let tc=0,tt=0,td=0;const rows=[];
     for(const a of S.agents){let c=0,t=0,d=0,n=0;for(const m of S.msgs[a.id]||[])if(m.kind==='meta'&&m.data){n++;c+=Number(m.data.cost||0);t+=Number(m.data.turns||0);d+=Number(m.data.duration_ms||0)}tc+=c;tt+=t;td+=d;rows.push([a,n,c,t,d])}
-    body=h('div',{},h('h4',{class:'sh'},'이 앱에서 한 일 (대화 기록 기준)'),
+    if(!S.rlAt||Date.now()-S.rlAt>4000){S.rlAt=Date.now();api('/api/ratelimit').then(r=>{const k=JSON.stringify(r);if(k!==S.rlKey){S.rlKey=k;S.rl=r;if(S.setTab==='usage')openSettings()}}).catch(()=>{})}
+    body=h('div',{},h('h4',{class:'sh'},'요금제 한도 (Claude Code가 마지막으로 알려 준 값)'),rateLimitView(S.rl),
+      h('h4',{class:'sh'},'이 앱에서 한 일 (대화 기록 기준)'),
       row('전체 비용','Claude Code가 알려 준 추정치 합계 (구독 요금제에서는 실제 청구와 다를 수 있음)',h('b',{},'$'+tc.toFixed(3))),
       row('전체 턴',null,h('b',{},String(tt))),row('전체 작업 시간',null,h('b',{},(td/60000).toFixed(1)+'분')),
       h('h4',{class:'sh'},'에이전트별'),
       rows.length?rows.map(([a,n,c,t,d])=>h('div',{class:'skl'},h('b',{},a.name+(a.project?' · '+(S.projects.find(p=>p.id===a.project)?.name||''):'')),h('span',{},`${n}회 작업 · $${c.toFixed(3)} · ${t}턴 · ${(d/60000).toFixed(1)}분`))):h('span',{class:'note'},'에이전트가 없습니다.'),
-      h('p',{class:'note',style:'margin-top:12px'},'플랜 사용량과 한도는 claude.ai 설정의 "사용량"에서 확인하세요. 이 앱은 대화 기록에 남은 값만 합산합니다.'));
+      h('p',{class:'note',style:'margin-top:12px'},'아래 "이 앱에서 한 일"은 대화 기록에 남은 값만 합산합니다. 정확한 플랜 사용량은 claude.ai 설정의 "사용량"에서 확인하세요.'));
   }else if(['code','skills','mcp','plugins'].includes(S.setTab)){
     const c=S.cc;
     const chips=a=>a&&a.length?h('div',{class:'chips2'},a.map(x=>h('span',{class:'chip'},x))):h('span',{class:'note'},'없음');
