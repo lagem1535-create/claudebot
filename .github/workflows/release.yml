@@ -1,0 +1,42 @@
+# 태그(v로 시작)를 올리면 Windows·Linux 실행 파일을 만들어 Releases 에 붙입니다.
+# 사용: git tag v0.3.1 && git push origin v0.3.1
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: 태그를 버전으로 반영
+        shell: bash
+        run: |
+          VER="${GITHUB_REF_NAME#v}"
+          sed -i "s/^version = .*/version = \"$VER\"/" runner/Cargo.toml app/Cargo.toml
+      - name: 빌드
+        run: cargo build --release
+      - name: Linux 파일 이름 정리
+        if: runner.os == 'Linux'
+        run: |
+          cp target/release/claudebot-runner claudebot-runner-linux
+          cp target/release/claudebot claudebot-linux
+      - name: Releases 에 올리기 (Windows)
+        if: runner.os == 'Windows'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/release/claudebot.exe
+            target/release/claudebot-runner.exe
+      - name: Releases 에 올리기 (Linux)
+        if: runner.os == 'Linux'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            claudebot-runner-linux
+            claudebot-linux
