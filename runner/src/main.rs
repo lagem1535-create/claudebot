@@ -2623,7 +2623,7 @@ fn handle(app: Arc<App>, mut req: Request) {
         (Method::Get, ["api", "cc", "sessions"]) => {
             let mut linked: HashSet<String> = app.inner.lock().unwrap().s.agents.iter().map(|a| a.session.clone()).filter(|x| !x.is_empty()).collect();
             linked.extend(cc_auto_load(&app.data).known);
-            send_json(req, 200, json!({"sessions": cc_sessions(&linked), "auto": cc_auto_view(&app.data)}))
+            send_json(req, 200, json!({"sessions": cc_sessions(&linked, 60), "auto": cc_auto_view(&app.data)}))
         }
         (Method::Post, ["api", "cc", "import"]) => {
             let sid = input["id"].as_str().unwrap_or("").to_string();
@@ -2632,19 +2632,9 @@ fn handle(app: Arc<App>, mut req: Request) {
                 Err(e) => send_json(req, 400, json!({"error": e})),
             }
         }
-        (Method::Post, ["api", "cc", "auto"]) => {
-            let mut c = cc_auto_load(&app.data);
-            let on = input["on"].as_bool().unwrap_or(c.on);
-            if on && !c.on {
-                c.since = now(); // 켠 뒤에 새로 생기거나 이어진 대화만 자동으로 가져옵니다.
-                c.last = 0;
-            }
-            c.on = on;
-            if let Some(m) = input["minutes"].as_u64() {
-                c.minutes = m.clamp(1, 1440);
-            }
-            cc_auto_store(&app.data, &c);
-            send_json(req, 200, json!({"auto": cc_auto_view(&app.data)}))
+        (Method::Post, ["api", "cc", "update"]) => {
+            let (imported, refreshed) = cc_update(&app);
+            send_json(req, 200, json!({"imported": imported, "refreshed": refreshed, "auto": cc_auto_view(&app.data)}))
         }
         (Method::Get, ["api", "rc", id]) => send_json(req, 200, rc_view(id)),
         (Method::Post, ["api", "rc", id]) => {
@@ -3408,7 +3398,7 @@ fn cc_find(id: &str) -> Option<PathBuf> {
     None
 }
 
-fn cc_sessions(linked: &std::collections::HashSet<String>) -> Vec<Value> {
+fn cc_sessions(linked: &std::collections::HashSet<String>, cap: usize) -> Vec<Value> {
     let mut out: Vec<(u64, Value)> = Vec::new();
     let Some(root) = cc_projects_dir() else { return vec![] };
     let Ok(rd) = std::fs::read_dir(root) else { return vec![] };
@@ -3429,7 +3419,7 @@ fn cc_sessions(linked: &std::collections::HashSet<String>) -> Vec<Value> {
         }
     }
     out.sort_by(|a, b| b.0.cmp(&a.0));
-    out.into_iter().take(40).map(|x| x.1).collect()
+    out.into_iter().take(cap).map(|x| x.1).collect()
 }
 
 fn cc_import(app: &App, sid: &str, name: &str) -> Result<Agent, String> {
@@ -3530,40 +3520,74 @@ fn cc_auto_tick(app: &App) {
         let cut = c.known.len() - 4000;
         c.known.drain(..cut);
     }
-    let due = c.on && now().saturating_sub(c.last) >= c.minutes * 60_000;
-    if !due {
-        if changed {
-            cc_auto_store(&app.data, &c);
-        }
-        return;
+    if changed {
+        cc_auto_store(&app.data, &c);
     }
-    c.last = now();
-    cc_auto_store(&app.data, &c);
+    let _ = (own_dirs, busy_dirs);
+}
+
+/// "모든 대화 가져오기 / 업데이트" 버튼: 아직 안 가져온 대화를 모두 가져오고, 이미 가져온 대화에 터미널에서 더해진 메시지를 채팅에 덧붙입니다.
+/// 돌려주는 값: (새로 가져온 대화 수, 덧붙인 메시지 수)
+fn cc_update(app: &App) -> (u64, u64) {
+    cc_auto_tick(app);
+    let c = cc_auto_load(&app.data);
+    let (own_dirs, busy, imported_agents): (Vec<PathBuf>, HashSet<String>, Vec<(String, String)>) = {
+        let g = app.inner.lock().unwrap();
+        (
+            g.s.agents.iter().filter(|a| !a.imported).map(|a| PathBuf::from(&a.dir)).chain(g.s.projects.iter().map(|p| PathBuf::from(&p.dir))).collect(),
+            g.s.agents.iter().filter(|a| a.status == "working" || a.queue > 0).map(|a| a.id.clone()).collect(),
+            g.s.agents.iter().filter(|a| a.imported && !a.session.is_empty()).map(|a| (a.id.clone(), a.session.clone())).collect(),
+        )
+    };
+    // 1) 이미 가져온 대화: 터미널에서 더해진 메시지 덧붙이기 (일하는 중인 에이전트는 건너뜀)
+    let mut refreshed = 0u64;
+    for (id, sid) in imported_agents {
+        if busy.contains(&id) {
+            continue;
+        }
+        let Some(path) = cc_find(&sid) else { continue };
+        let (_, file) = cc_parse(&path, 40_000_000, 200, false);
+        let mut g = app.inner.lock().unwrap();
+        let have: Vec<String> = g.s.msgs.get(&id).map(|l| l.iter().filter(|m| m.kind == "text").map(|m| m.text.trim().to_string()).collect()).unwrap_or_default();
+        // 채팅의 최근 메시지(뒤에서 10개까지)가 기록 파일의 어디에 있는지 찾아, 그 뒤의 것만 새 메시지로 봅니다. 못 찾으면 중복을 막기 위해 아무것도 더하지 않습니다.
+        let mut start = None;
+        for h in have.iter().rev().take(10) {
+            if let Some(i) = file.iter().rposition(|m| m.1.trim() == h) {
+                start = Some(i + 1);
+                break;
+            }
+        }
+        let Some(start) = start else { continue };
+        if start >= file.len() {
+            continue;
+        }
+        for (role, text) in &file[start..] {
+            app.add_msg(&mut g, &id, role, "text", text);
+            refreshed += 1;
+        }
+        app.save(&g);
+    }
+    // 2) 아직 안 가져온 대화 모두 가져오기 (이 앱이 스스로 만든 대화는 제외)
     let known: HashSet<String> = c.known.iter().cloned().collect();
-    let mut imported = 0;
-    for sv in cc_sessions(&known) {
-        let (sid, cwd, mtime) = (sv["id"].as_str().unwrap_or(""), sv["cwd"].as_str().unwrap_or(""), sv["mtime"].as_u64().unwrap_or(0));
-        // 켠 뒤에 바뀐 대화만, 그리고 1분 이상 조용한(지금 쓰는 중이 아닌) 대화만 가져옵니다.
-        if sv["linked"] == true || sv["exists"] != true || mtime < c.since || now().saturating_sub(mtime) < 60_000 {
+    let mut imported = 0u64;
+    for sv in cc_sessions(&known, 200) {
+        let (sid, cwd) = (sv["id"].as_str().unwrap_or(""), sv["cwd"].as_str().unwrap_or(""));
+        if sv["linked"] == true || sv["exists"] != true {
             continue;
         }
         let cp = Path::new(cwd);
-        // 이 앱이 스스로 만든 대화(에이전트 폴더, 데이터 폴더)는 건너뜁니다.
-        if cp.starts_with(&app.work) || cp.starts_with(&app.data) || own_dirs.iter().any(|d| cp.starts_with(d)) || busy_dirs.iter().any(|d| d == cwd) {
+        if cp.starts_with(&app.work) || cp.starts_with(&app.data) || own_dirs.iter().any(|d| cp.starts_with(d)) {
             continue;
-        }
-        if imported >= 5 {
-            break;
         }
         if cc_import(app, sid, "").is_ok() {
             imported += 1;
         }
     }
-    if imported > 0 {
-        let mut c = cc_auto_load(&app.data);
-        c.count += imported;
-        cc_auto_store(&app.data, &c);
-    }
+    let mut c = cc_auto_load(&app.data);
+    c.count += imported;
+    c.last = now();
+    cc_auto_store(&app.data, &c);
+    (imported, refreshed)
 }
 
 // ---- 원격 제어(Remote Control): 에이전트 폴더를 Claude 앱(claude.ai/code)에서 열기 ----

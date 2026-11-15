@@ -1378,16 +1378,18 @@ function rcBlock(a){
     h('p',{class:'note',style:'margin:0 0 6px'},'Claude Code의 원격 제어(Remote Control)를 이 에이전트의 작업 폴더에서 켭니다. 켜면 Claude 앱(claude.ai/code)의 목록에 "ClaudeBot · '+a.name+'"으로 나타나요. 거기서 하는 대화는 이 채팅과는 별개의 새 대화입니다. 구독 로그인이 필요해요.'),box);
 }
 function openCCImport(){
-  const st={list:null,err:'',auto:null};
-  const setAuto=async body=>{try{const r=await post('/api/cc/auto',body);st.auto=r.auto;draw()}catch(e){$('#dlgerr').textContent=e.message}};
+  const st={list:null,err:'',auto:null,msg:''};
+  const reload=()=>api('/api/cc/sessions').then(r=>{st.list=r.sessions||[];st.auto=r.auto||null;draw()}).catch(e=>{st.err=e.message;draw()});
+  const update=async e=>{const b=e.target;b.disabled=true;b.textContent='가져오는 중…';$('#dlgerr').textContent='';
+    try{const r=await post('/api/cc/update',{});st.msg=`새 대화 ${r.imported}개를 가져오고, 가져온 대화에 새 메시지 ${r.refreshed}개를 더했어요.`;await reload()}catch(er){$('#dlgerr').textContent=er.message;b.disabled=false;draw()}};
   const autoRow=()=>{const a=st.auto;if(!a)return null;
     const t=x=>x?new Date(x).toLocaleString('ko-KR',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'}):'';
+    const first=!a.last;
     return h('div',{class:'mcpbox',style:'margin-bottom:10px'},
       h('div',{style:'display:flex;gap:10px;align-items:center;flex-wrap:wrap'},
-        h('button',{class:a.on?'primary':'',onclick:()=>setAuto({on:!a.on})},a.on?'자동 가져오기 켜짐 (누르면 끔)':'자동 가져오기 켜기'),
-        h('span',{class:'note'},'주기'),
-        h('select',{'aria-label':'자동 가져오기 주기',onchange:e=>setAuto({minutes:Number(e.target.value)})},[[1,'1분'],[5,'5분'],[15,'15분'],[60,'1시간']].map(([v,l])=>h('option',{value:v,selected:a.minutes===v},l)))),
-      h('p',{class:'note',style:'margin:8px 0 0'},a.on?`켠 시각(${t(a.since)}) 뒤에 새로 하거나 이어 간 Claude Code 대화를 ${a.minutes}분마다 자동으로 가져옵니다. 지금까지 ${a.count||0}개 가져옴${a.last?' · 마지막 확인 '+t(a.last):''}. 쓰는 중인 대화는 1분쯤 조용해진 뒤 가져와요.`:'켜면 그 뒤에 새로 하거나 이어 간 Claude Code 대화를 정한 주기마다 자동으로 가져옵니다. 예전 대화는 아래 목록에서 직접 가져오세요.'))};
+        h('button',{class:'primary',onclick:update},first?'모든 대화 가져오기':'업데이트'),
+        h('span',{class:'note'},first?'이 컴퓨터의 Claude Code 대화를 한 번에 모두 가져옵니다.':`마지막 업데이트 ${t(a.last)} · 지금까지 ${a.count||0}개 가져옴`)),
+      h('p',{class:'note',style:'margin:8px 0 0'},st.msg||(first?'가져온 뒤에는 이 버튼이 "업데이트"로 바뀌어요.':'업데이트를 누르면 새로 생긴 대화를 가져오고, 이미 가져온 대화에는 터미널에서 더 나눈 메시지를 덧붙여요.')))};
   const draw=()=>{const ab=$('#ccauto');if(ab)ab.replaceChildren(...[autoRow()].filter(Boolean));const box=$('#ccbox');if(!box)return;
     if(st.err){box.replaceChildren(h('p',{class:'note'},st.err));return}
     if(!st.list){box.replaceChildren(h('p',{class:'note'},'Claude Code 대화를 찾는 중…'));return}
@@ -1402,7 +1404,7 @@ function openCCImport(){
     h('p',{class:'sub'},'이 컴퓨터에서 Claude Code로 한 대화를 에이전트로 가져와 이어서 합니다. 대화가 있던 폴더에서 그대로 일하고, 최근 메시지 200개를 보여 줍니다. 터미널과 앱에서 같은 대화를 동시에 쓰지는 마세요.'),
     h('div',{class:'errline',id:'dlgerr'}),h('div',{id:'ccauto'}),h('div',{class:'sbody',id:'ccbox'},h('p',{class:'note'},'Claude Code 대화를 찾는 중…'))));
   render();
-  api('/api/cc/sessions').then(r=>{st.list=r.sessions||[];st.auto=r.auto||null;draw()}).catch(e=>{st.err=e.message;draw()});
+  reload();
 }
 function openAgentSettings(a){
   const f={style:a.style||'',mcp:new Set((a.mcp||'').split(',').map(x=>x.trim()).filter(Boolean))};
