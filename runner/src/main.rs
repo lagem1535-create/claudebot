@@ -3153,6 +3153,19 @@ fn handle(app: Arc<App>, mut req: Request) {
                 _ => send_json(req, 503, json!({"error": "화면을 아직 캡처할 수 없습니다."})),
             }
         }
+        (Method::Delete, ["api", "agents", id, "file"]) => {
+            let agent = app.inner.lock().unwrap().s.agents.iter().find(|a| a.id == *id).cloned();
+            let Some(agent) = agent else { return send_json(req, 404, json!({"error": "에이전트가 없습니다."})) };
+            let root = PathBuf::from(&agent.dir);
+            let rel = q.get("path").cloned().unwrap_or_default();
+            match (root.join(&rel).canonicalize(), root.canonicalize()) {
+                (Ok(f), Ok(r)) if f != r && f.starts_with(&r) && f.is_file() => match std::fs::remove_file(&f) {
+                    Ok(_) => send_json(req, 200, json!({"ok": true})),
+                    Err(e) => send_json(req, 500, json!({"error": format!("지우지 못했습니다: {e}")})),
+                },
+                _ => send_json(req, 404, json!({"error": "파일이 없습니다."})),
+            }
+        }
         (Method::Get, ["api", "agents", id, what]) => {
             let agent = app.inner.lock().unwrap().s.agents.iter().find(|a| a.id == *id).cloned();
             let Some(agent) = agent else { return send_json(req, 404, json!({"error": "에이전트가 없습니다."})) };
@@ -3170,10 +3183,35 @@ fn handle(app: Arc<App>, mut req: Request) {
                         (Ok(f), Ok(r)) if f.starts_with(&r) && f.is_file() => match std::fs::read(&f) {
                             Ok(data) => {
                                 let name = f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                                let resp = Response::from_data(data)
-                                    .with_header(hdr("Content-Type", "application/octet-stream"))
-                                    .with_header(hdr("Content-Disposition", &format!("attachment; filename*=UTF-8''{}", pct_encode(&name))))
-                                    .with_header(hdr("Access-Control-Allow-Origin", "*"));
+                                let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
+                                let inline_ct = if q.get("inline").map_or(false, |v| v == "1") {
+                                    match ext.as_str() {
+                                        "html" | "htm" => Some("text/html; charset=utf-8"),
+                                        "txt" | "md" | "json" | "js" | "css" | "py" | "rs" | "toml" | "yml" | "yaml" | "csv" | "log" | "sh" | "xml" | "ts" | "c" | "h" | "cpp" | "java" | "go" => Some("text/plain; charset=utf-8"),
+                                        "png" => Some("image/png"),
+                                        "jpg" | "jpeg" => Some("image/jpeg"),
+                                        "gif" => Some("image/gif"),
+                                        "webp" => Some("image/webp"),
+                                        "svg" => Some("image/svg+xml"),
+                                        "pdf" => Some("application/pdf"),
+                                        _ => None,
+                                    }
+                                } else {
+                                    None
+                                };
+                                let mut resp = Response::from_data(data).with_header(hdr("Access-Control-Allow-Origin", "*"));
+                                if let Some(ct) = inline_ct {
+                                    // 에이전트가 만든 파일이 앱의 로그인 정보에 접근하지 못하도록 격리(sandbox)해서 보여 줍니다.
+                                    resp = resp
+                                        .with_header(hdr("Content-Type", ct))
+                                        .with_header(hdr("Content-Security-Policy", "sandbox allow-scripts allow-forms allow-popups"))
+                                        .with_header(hdr("X-Content-Type-Options", "nosniff"))
+                                        .with_header(hdr("Content-Disposition", "inline"));
+                                } else {
+                                    resp = resp
+                                        .with_header(hdr("Content-Type", "application/octet-stream"))
+                                        .with_header(hdr("Content-Disposition", &format!("attachment; filename*=UTF-8''{}", pct_encode(&name))));
+                                }
                                 let _ = req.respond(resp);
                             }
                             Err(_) => send_json(req, 404, json!({"error": "파일을 읽지 못했습니다."})),

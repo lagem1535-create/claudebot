@@ -225,6 +225,12 @@ details.think div{white-space:pre-wrap;border-left:2px solid var(--line);padding
 .note{color:var(--muted);font-size:12.5px}
 .file{display:flex;gap:8px;padding:5px 8px;border-radius:8px;font-size:13px;text-decoration:none;color:inherit}
 .file:hover{background:var(--raise)}
+.file,.win .fi{cursor:pointer;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;touch-action:manipulation}
+.fmenu{position:fixed;z-index:200;min-width:170px;background:var(--card,#fff);border:1px solid var(--line,#ddd);border-radius:12px;box-shadow:0 8px 28px rgba(0,0,0,.22);padding:6px;display:flex;flex-direction:column}
+.fmenu .fmt{padding:6px 10px 8px;font-size:12px;color:var(--muted,#777);max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fmenu button{text-align:left;padding:11px 12px;border-radius:8px;font-size:14.5px;background:none;border:0;color:inherit;cursor:pointer}
+.fmenu button:hover{background:var(--raise,#f2efe9)}
+.fmenu button.danger{color:#c0392b}
 .file .sz{margin-left:auto;color:var(--muted);font-size:11.5px;flex:none}
 .file .p{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .path{font-family:var(--mono);font-size:12px;overflow-wrap:anywhere}
@@ -287,7 +293,7 @@ details.think div{white-space:pre-wrap;border-left:2px solid var(--line);padding
 .zoom .desk{border-radius:10px;box-shadow:0 10px 50px rgba(0,0,0,.6)}
 .zoom .win .tb{cursor:move}
 /* dialogs */
-.veil{position:fixed;inset:0;background:rgba(0,0,0,.45);display:grid;place-items:center;z-index:10;padding:16px}
+.veil{position:fixed;inset:0;background:rgba(0,0,0,.45);display:grid;place-items:center;z-index:30;padding:16px}
 .dlg{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:22px;width:480px;max-width:100%;max-height:92vh;overflow:auto}
 .dlg h3{margin:0 0 4px;font-size:17px}
 .pet{position:fixed;z-index:60;display:flex;flex-direction:column;align-items:flex-end;gap:6px;touch-action:none;user-select:none}
@@ -1018,7 +1024,7 @@ function winBody(a,w){
   if(w.type==='files'){
     const fs=(S.files[a.id]?.files||[]).filter(f=>!f.dir);
     return{title:'작업 폴더',menu:['파일','홈','보기'],status:`${fs.length}개 항목 · ${base(a.dir)}`,
-      body:fs.length?h('div',{class:'grid'},fs.slice(0,60).map(f=>h('a',{class:'fi',title:f.path+' (받기)',href:fileUrl(a,f.path),download:base(f.path)},h('i',{},fileIcon(f.path)),base(f.path)))):h('div',{class:'wait'},'아직 만든 파일이 없습니다.')};
+      body:fs.length?h('div',{class:'grid'},fs.slice(0,60).map(f=>fileTouch(h('div',{class:'fi',title:f.path+' (두 번 누르면 열기, 길게 누르면 메뉴)'},h('i',{},fileIcon(f.path)),base(f.path)),a,f))):h('div',{class:'wait'},'아직 만든 파일이 없습니다.')};
   }
   if(w.type==='doc'){
     let body;
@@ -1043,6 +1049,38 @@ function winBody(a,w){
   return{title:name||'작업',status:pend?'진행 중…':'완료',body:h('pre',{},JSON.stringify(i,null,2)+(d.result?'\n\n'+d.result:''))};
 }
 const fileUrl=(a,p)=>`${S.conn.url}/api/agents/${a.id}/file?path=${encodeURIComponent(p)}&t=${encodeURIComponent(S.conn.token)}`;
+
+// 파일: 두 번 누르면(더블탭/더블클릭) 열기, 길게 누르면(우클릭) 메뉴 [열기 / 다운로드 / 삭제]
+function openFile(a,f){window.open(fileUrl(a,f.path)+'&inline=1','_blank')}
+function downloadFile(a,f){const l=document.createElement('a');l.href=fileUrl(a,f.path);l.download=base(f.path);document.body.append(l);l.click();l.remove()}
+function closeFileMenu(){document.querySelectorAll('.fmenu').forEach(m=>m.remove())}
+function deleteFile(a,f){
+  confirmDo(`${base(f.path)} 삭제할까요?`,'작업 폴더에서 이 파일이 지워지고 되돌릴 수 없습니다.','삭제',async()=>{
+    await api(`/api/agents/${a.id}/file?path=${encodeURIComponent(f.path)}`,{method:'DELETE'});
+    const d=S.files[a.id];if(d)d.files=d.files.filter(x=>x.path!==f.path);
+    const p=$('#pane');if(p&&S.tab==='files')p.replaceChildren(filesPane(a));refreshDesk(a);
+  });
+}
+function fileMenu(a,f,x,y){
+  closeFileMenu();
+  const item=(t,fn,cls)=>h('button',{class:cls||'',onclick:e=>{e.stopPropagation();closeFileMenu();fn()}},t);
+  const m=h('div',{class:'fmenu',role:'menu'},h('div',{class:'fmt'},base(f.path)),item('열기',()=>openFile(a,f)),item('다운로드',()=>downloadFile(a,f)),item('삭제',()=>deleteFile(a,f),'danger'));
+  document.body.append(m);
+  const w=m.offsetWidth,hh=m.offsetHeight;
+  m.style.left=Math.max(8,Math.min(x,innerWidth-w-8))+'px';m.style.top=Math.max(8,Math.min(y,innerHeight-hh-8))+'px';
+  setTimeout(()=>{const off=e=>{if(!m.contains(e.target)){closeFileMenu();removeEventListener('pointerdown',off,true)}};addEventListener('pointerdown',off,true)},0);
+}
+function fileTouch(el,a,f){
+  let timer=null,lp=false,last=0,sx=0,sy=0;
+  const stop=()=>{clearTimeout(timer);timer=null};
+  el.addEventListener('pointerdown',e=>{if(e.button>0)return;lp=false;sx=e.clientX;sy=e.clientY;stop();timer=setTimeout(()=>{lp=true;fileMenu(a,f,sx,sy)},500)});
+  el.addEventListener('pointermove',e=>{if(timer&&Math.hypot(e.clientX-sx,e.clientY-sy)>10)stop()});
+  el.addEventListener('pointercancel',stop);
+  el.addEventListener('pointerup',e=>{if(e.button>0)return;stop();if(lp)return;const t=Date.now();if(t-last<400){last=0;openFile(a,f)}else last=t});
+  el.addEventListener('contextmenu',e=>{e.preventDefault();stop();lp=true;fileMenu(a,f,e.clientX,e.clientY)});
+  el.addEventListener('click',e=>e.preventDefault());
+  return el;
+}
 function deskEl(a,big){
   const wins=deskWindows(a);const c=hue(a.id);const now=new Date();
   const desk=h('div',{class:'desk','data-agent':a.id},
@@ -1111,7 +1149,7 @@ function filesPane(a){
   const data=S.files[a.id];if(!data)return h('p',{class:'note'},'불러오는 중…');
   const fs=data.files.filter(f=>!f.dir);
   return h('div',{},h('h4',{},'작업 폴더'),h('div',{class:'path'},data.dir),h('h4',{},`파일 ${fs.length}개`),
-    fs.length?fs.map(f=>h('a',{class:'file',href:fileUrl(a,f.path),download:base(f.path)},h('span',{class:'p'},f.path),h('span',{class:'sz'},fmtSize(f.size)))):h('p',{class:'note'},'아직 만든 파일이 없습니다.'));
+    fs.length?fs.map(f=>fileTouch(h('div',{class:'file',title:'두 번 누르면 열기, 길게 누르면 메뉴'},h('span',{class:'p'},f.path),h('span',{class:'sz'},fmtSize(f.size))),a,f)):h('p',{class:'note'},'아직 만든 파일이 없습니다.'));
 }
 function infoPane(a){
   const modeName=(MODES.find(m=>m[0]===a.mode)||[])[1]||a.mode;
