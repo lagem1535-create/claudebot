@@ -2621,44 +2621,43 @@ fn handle(app: Arc<App>, mut req: Request) {
     }
     match (&method, parts.as_slice()) {
         (Method::Get, ["api", "cc", "sessions"]) => {
-            let linked: std::collections::HashSet<String> = app.inner.lock().unwrap().s.agents.iter().map(|a| a.session.clone()).filter(|x| !x.is_empty()).collect();
-            send_json(req, 200, json!({"sessions": cc_sessions(&linked)}))
+            let mut linked: HashSet<String> = app.inner.lock().unwrap().s.agents.iter().map(|a| a.session.clone()).filter(|x| !x.is_empty()).collect();
+            linked.extend(cc_auto_load(&app.data).known);
+            send_json(req, 200, json!({"sessions": cc_sessions(&linked), "auto": cc_auto_view(&app.data)}))
         }
         (Method::Post, ["api", "cc", "import"]) => {
             let sid = input["id"].as_str().unwrap_or("").to_string();
-            let Some(path) = cc_find(&sid) else { return send_json(req, 404, json!({"error": "그 대화 기록을 찾지 못했습니다."})) };
-            let (cwd, msgs) = cc_parse(&path, 40_000_000, 200, false);
-            if cwd.is_empty() || !Path::new(&cwd).is_dir() {
-                return send_json(req, 400, json!({"error": format!("이 대화를 하던 폴더({cwd})가 이 컴퓨터에 없어서 이어갈 수 없습니다.")}));
+            match cc_import(&app, &sid, input["name"].as_str().unwrap_or("")) {
+                Ok(a) => send_json(req, 200, json!({"agent": a})),
+                Err(e) => send_json(req, 400, json!({"error": e})),
             }
-            let mut g = app.inner.lock().unwrap();
-            if g.s.agents.iter().any(|a| a.session == sid) {
-                return send_json(req, 400, json!({"error": "이미 가져온 대화입니다."}));
+        }
+        (Method::Post, ["api", "cc", "auto"]) => {
+            let mut c = cc_auto_load(&app.data);
+            let on = input["on"].as_bool().unwrap_or(c.on);
+            if on && !c.on {
+                c.since = now(); // 켠 뒤에 새로 생기거나 이어진 대화만 자동으로 가져옵니다.
+                c.last = 0;
             }
-            let base: String = input["name"].as_str().map(|n| n.trim().to_string()).filter(|n| !n.is_empty())
-                .unwrap_or_else(|| msgs.iter().find(|m| m.0 == "user").map(|m| m.1.replace('\n', " ").chars().take(14).collect::<String>().trim().to_string()).unwrap_or_default());
-            let base = if base.is_empty() { "가져온 대화".to_string() } else { base.chars().take(26).collect() };
-            let mut name = base.clone();
-            let mut n = 2;
-            while g.s.agents.iter().any(|a| a.project.is_empty() && a.name.eq_ignore_ascii_case(&name)) {
-                name = format!("{base} {n}");
-                n += 1;
+            c.on = on;
+            if let Some(m) = input["minutes"].as_u64() {
+                c.minutes = m.clamp(1, 1440);
             }
-            let a = app.new_agent(&mut g, &name, "Claude Code 에서 가져온 대화", "acceptEdits".to_string(), false, "", "", "");
-            let id = a.id.clone();
-            if let Some(x) = g.s.agents.iter_mut().find(|x| x.id == id) {
-                x.dir = cwd.clone();
-                x.session = sid.clone();
-                x.imported = true;
+            cc_auto_store(&app.data, &c);
+            send_json(req, 200, json!({"auto": cc_auto_view(&app.data)}))
+        }
+        (Method::Get, ["api", "rc", id]) => send_json(req, 200, rc_view(id)),
+        (Method::Post, ["api", "rc", id]) => {
+            if input["action"] == "stop" {
+                rc_stop(id);
+                return send_json(req, 200, rc_view(id));
             }
-            app.add_msg(&mut g, &id, "system", "system", &format!("Claude Code 에서 가져온 대화입니다. 작업 폴더는 {cwd} 이고, 최근 {}개 메시지만 가져왔습니다. 같은 대화를 터미널과 동시에 쓰지는 마세요.", msgs.len()));
-            for (role, text) in &msgs {
-                app.add_msg(&mut g, &id, role, "text", text);
+            let agent = app.inner.lock().unwrap().s.agents.iter().find(|a| a.id == *id).cloned();
+            let Some(agent) = agent else { return send_json(req, 404, json!({"error": "에이전트가 없습니다."})) };
+            match rc_start(&app, &agent) {
+                Ok(_) => send_json(req, 200, rc_view(id)),
+                Err(e) => send_json(req, 400, json!({"error": e})),
             }
-            let a = g.s.agents.iter().find(|x| x.id == id).cloned().unwrap();
-            app.emit_agent(&mut g, &id);
-            app.save(&g);
-            send_json(req, 200, json!({"agent": a}))
         }
         (Method::Get, ["api", "ratelimit"]) => {
             let v: Value = std::fs::read_to_string(app.data.join("ratelimit.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(json!({"info": null}));
@@ -3231,6 +3230,7 @@ fn handle(app: Arc<App>, mut req: Request) {
                 if pid.is_some() {
                     g.stopped.insert(id.to_string());
                 }
+                rc_stop(id);
                 g.s.agents.retain(|a| a.id != *id);
                 g.s.msgs.remove(*id);
                 g.senders.remove(*id);
@@ -3432,6 +3432,254 @@ fn cc_sessions(linked: &std::collections::HashSet<String>) -> Vec<Value> {
     out.into_iter().take(40).map(|x| x.1).collect()
 }
 
+fn cc_import(app: &App, sid: &str, name: &str) -> Result<Agent, String> {
+    let path = cc_find(sid).ok_or("그 대화 기록을 찾지 못했습니다.")?;
+    let (cwd, msgs) = cc_parse(&path, 40_000_000, 200, false);
+    if cwd.is_empty() || !Path::new(&cwd).is_dir() {
+        return Err(format!("이 대화를 하던 폴더({cwd})가 이 컴퓨터에 없어서 이어갈 수 없습니다."));
+    }
+    let mut g = app.inner.lock().unwrap();
+    if g.s.agents.iter().any(|a| a.session == sid) {
+        return Err("이미 가져온 대화입니다.".into());
+    }
+    let base: String = Some(name.trim().to_string()).filter(|n| !n.is_empty())
+        .unwrap_or_else(|| msgs.iter().find(|m| m.0 == "user").map(|m| m.1.replace('\n', " ").chars().take(14).collect::<String>().trim().to_string()).unwrap_or_default());
+    let base: String = if base.is_empty() { "가져온 대화".to_string() } else { base.chars().take(26).collect() };
+    let mut name = base.clone();
+    let mut n = 2;
+    while g.s.agents.iter().any(|a| a.project.is_empty() && a.name.eq_ignore_ascii_case(&name)) {
+        name = format!("{base} {n}");
+        n += 1;
+    }
+    let a = app.new_agent(&mut g, &name, "Claude Code 에서 가져온 대화", "acceptEdits".to_string(), false, "", "", "");
+    let id = a.id.clone();
+    if let Some(x) = g.s.agents.iter_mut().find(|x| x.id == id) {
+        x.dir = cwd.clone();
+        x.session = sid.to_string();
+        x.imported = true;
+    }
+    app.add_msg(&mut g, &id, "system", "system", &format!("Claude Code 에서 가져온 대화입니다. 작업 폴더는 {cwd} 이고, 최근 {}개 메시지만 가져왔습니다. 같은 대화를 터미널과 동시에 쓰지는 마세요.", msgs.len()));
+    for (role, text) in &msgs {
+        app.add_msg(&mut g, &id, role, "text", text);
+    }
+    let a = g.s.agents.iter().find(|x| x.id == id).cloned().unwrap();
+    app.emit_agent(&mut g, &id);
+    app.save(&g);
+    drop(g);
+    let mut c = cc_auto_load(&app.data);
+    if !c.known.iter().any(|k| k == sid) {
+        c.known.push(sid.to_string());
+        cc_auto_store(&app.data, &c);
+    }
+    Ok(a)
+}
+
+// ---- Claude Code 대화 자동 가져오기 (주기) ----
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct CcAuto {
+    #[serde(default)]
+    on: bool,
+    #[serde(default)]
+    minutes: u64,
+    #[serde(default)]
+    since: u64,
+    #[serde(default)]
+    last: u64,
+    #[serde(default)]
+    count: u64,
+    #[serde(default)]
+    known: Vec<String>, // 이미 가져왔거나 이 앱이 만든 대화 번호 (다시 가져오지 않음)
+}
+
+fn cc_auto_load(data: &Path) -> CcAuto {
+    let mut c: CcAuto = std::fs::read_to_string(data.join("ccauto.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+    if c.minutes == 0 {
+        c.minutes = 5;
+    }
+    c
+}
+
+fn cc_auto_store(data: &Path, c: &CcAuto) {
+    let _ = std::fs::write(data.join("ccauto.json"), serde_json::to_string(c).unwrap_or_default());
+}
+
+fn cc_auto_view(data: &Path) -> Value {
+    let c = cc_auto_load(data);
+    json!({"on": c.on, "minutes": c.minutes, "since": c.since, "last": c.last, "count": c.count})
+}
+
+/// 20초마다 불립니다. 이 앱의 에이전트가 쓰는 대화 번호를 기억해 두고, 켜져 있으면 주기에 맞춰 새 대화를 가져옵니다.
+fn cc_auto_tick(app: &App) {
+    let mut c = cc_auto_load(&app.data);
+    let (sessions, own_dirs, busy_dirs): (Vec<String>, Vec<PathBuf>, Vec<String>) = {
+        let g = app.inner.lock().unwrap();
+        (
+            g.s.agents.iter().map(|a| a.session.clone()).filter(|x| !x.is_empty()).collect(),
+            g.s.agents.iter().filter(|a| !a.imported).map(|a| PathBuf::from(&a.dir)).chain(g.s.projects.iter().map(|p| PathBuf::from(&p.dir))).collect(),
+            g.s.agents.iter().filter(|a| a.status == "working" || a.queue > 0).map(|a| a.dir.clone()).collect(),
+        )
+    };
+    let mut changed = false;
+    for sid in sessions {
+        if !c.known.contains(&sid) {
+            c.known.push(sid);
+            changed = true;
+        }
+    }
+    if c.known.len() > 4000 {
+        let cut = c.known.len() - 4000;
+        c.known.drain(..cut);
+    }
+    let due = c.on && now().saturating_sub(c.last) >= c.minutes * 60_000;
+    if !due {
+        if changed {
+            cc_auto_store(&app.data, &c);
+        }
+        return;
+    }
+    c.last = now();
+    cc_auto_store(&app.data, &c);
+    let known: HashSet<String> = c.known.iter().cloned().collect();
+    let mut imported = 0;
+    for sv in cc_sessions(&known) {
+        let (sid, cwd, mtime) = (sv["id"].as_str().unwrap_or(""), sv["cwd"].as_str().unwrap_or(""), sv["mtime"].as_u64().unwrap_or(0));
+        // 켠 뒤에 바뀐 대화만, 그리고 1분 이상 조용한(지금 쓰는 중이 아닌) 대화만 가져옵니다.
+        if sv["linked"] == true || sv["exists"] != true || mtime < c.since || now().saturating_sub(mtime) < 60_000 {
+            continue;
+        }
+        let cp = Path::new(cwd);
+        // 이 앱이 스스로 만든 대화(에이전트 폴더, 데이터 폴더)는 건너뜁니다.
+        if cp.starts_with(&app.work) || cp.starts_with(&app.data) || own_dirs.iter().any(|d| cp.starts_with(d)) || busy_dirs.iter().any(|d| d == cwd) {
+            continue;
+        }
+        if imported >= 5 {
+            break;
+        }
+        if cc_import(app, sid, "").is_ok() {
+            imported += 1;
+        }
+    }
+    if imported > 0 {
+        let mut c = cc_auto_load(&app.data);
+        c.count += imported;
+        cc_auto_store(&app.data, &c);
+    }
+}
+
+// ---- 원격 제어(Remote Control): 에이전트 폴더를 Claude 앱(claude.ai/code)에서 열기 ----
+struct RcProc {
+    pid: u32,
+    url: String,
+    log: String,
+    exited: bool,
+    started: u64,
+}
+
+fn rc_map() -> &'static Mutex<HashMap<String, RcProc>> {
+    static M: std::sync::OnceLock<Mutex<HashMap<String, RcProc>>> = std::sync::OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn rc_view(id: &str) -> Value {
+    match rc_map().lock().unwrap().get(id) {
+        Some(p) => json!({"running": !p.exited, "url": p.url, "log": p.log, "started": p.started}),
+        None => json!({"running": false, "url": "", "log": ""}),
+    }
+}
+
+fn rc_stop(id: &str) {
+    let pid = rc_map().lock().unwrap().remove(id).filter(|p| !p.exited).map(|p| p.pid);
+    if let Some(pid) = pid {
+        kill_tree(pid);
+    }
+}
+
+fn rc_clean(line: &str) -> String {
+    // 터미널 색상 코드(ESC[...)를 걷어냅니다.
+    let mut out = String::new();
+    let mut it = line.chars().peekable();
+    while let Some(ch) = it.next() {
+        if ch == '\u{1b}' {
+            if it.peek() == Some(&'[') {
+                it.next();
+                for c2 in it.by_ref() {
+                    if c2.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if !ch.is_control() {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn rc_start(app: &App, agent: &Agent) -> Result<(), String> {
+    use std::io::BufRead;
+    let claude = app.claude.clone().ok_or("Claude Code 를 찾지 못했습니다.")?;
+    if rc_map().lock().unwrap().get(&agent.id).map_or(false, |p| !p.exited) {
+        return Ok(());
+    }
+    let mut cmd = Command::new(&claude);
+    cmd.args(["remote-control", "--name", &format!("ClaudeBot · {}", agent.name)])
+        .current_dir(&agent.dir)
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0); // 끌 때 자식 프로세스까지 함께 끝내기 위해 따로 묶습니다.
+    }
+    let mut child = cmd
+        .spawn().map_err(|e| format!("원격 제어를 시작하지 못했습니다: {e}"))?;
+    let pid = child.id();
+    rc_map().lock().unwrap().insert(agent.id.clone(), RcProc { pid, url: String::new(), log: String::new(), exited: false, started: now() });
+    let feed = |id: String, r: Box<dyn std::io::Read + Send>| {
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(r).split(b'\n').map_while(Result::ok) {
+                let line = rc_clean(&String::from_utf8_lossy(&line));
+                let mut m = rc_map().lock().unwrap();
+                let Some(p) = m.get_mut(&id) else { break };
+                if p.pid != pid {
+                    break;
+                }
+                if p.url.is_empty() {
+                    if let Some(i) = line.find("https://claude.ai/") {
+                        p.url = line[i..].split_whitespace().next().unwrap_or("").to_string();
+                    }
+                }
+                if !line.trim().is_empty() {
+                    p.log.push_str(line.trim());
+                    p.log.push('\n');
+                    if p.log.len() > 3000 {
+                        let cut = p.log.len() - 3000;
+                        let cut = (cut..p.log.len()).find(|i| p.log.is_char_boundary(*i)).unwrap_or(0);
+                        p.log.drain(..cut);
+                    }
+                }
+            }
+        });
+    };
+    if let Some(o) = child.stdout.take() {
+        feed(agent.id.clone(), Box::new(o));
+    }
+    if let Some(e) = child.stderr.take() {
+        feed(agent.id.clone(), Box::new(e));
+    }
+    let id = agent.id.clone();
+    std::thread::spawn(move || {
+        let _ = child.wait();
+        if let Some(p) = rc_map().lock().unwrap().get_mut(&id) {
+            if p.pid == pid {
+                p.exited = true;
+            }
+        }
+    });
+    Ok(())
+}
+
 fn pct_encode(s: &str) -> String {
     s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
@@ -3545,6 +3793,13 @@ fn main() {
         });
     }
 
+    {
+        let app = app.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(20));
+            cc_auto_tick(&app);
+        });
+    }
     {
         let app = app.clone();
         std::thread::spawn(move || loop {
