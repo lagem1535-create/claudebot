@@ -50,6 +50,8 @@ struct Agent {
     skills: bool,
     #[serde(default)]
     denied: String,
+    #[serde(default)]
+    imported: bool, // Claude Code 에서 가져온 대화: 사용자의 기존 폴더를 쓰므로 CLAUDE.md 를 덮어쓰지 않습니다.
     dir: String,
     created: u64,
 }
@@ -1921,7 +1923,7 @@ impl App {
             id, name: name.to_string(), role: role.trim().to_string(), mode, browser,
             model: model.to_string(), effort: effort.to_string(), actual_model: String::new(),
             session: String::new(), status: "idle".into(), display, queue: 0, project: project.to_string(),
-            instructions: String::new(), style: String::new(), allowed: String::new(), mcp: String::new(), skills: true, denied: String::new(),
+            instructions: String::new(), style: String::new(), allowed: String::new(), mcp: String::new(), skills: true, denied: String::new(), imported: false,
             dir: dir.to_string_lossy().to_string(), created: now(),
         };
         g.s.agents.push(a.clone());
@@ -1931,6 +1933,9 @@ impl App {
     /// Each agent's folder gets a CLAUDE.md describing its role and teammates.
     fn write_briefs(&self, g: &Inner) {
         for a in &g.s.agents {
+            if a.imported {
+                continue;
+            }
             let mut t = format!("# 당신은 '{}' 입니다\n\n## 역할\n{}\n\n", a.name, if a.role.trim().is_empty() { "범용 도우미" } else { a.role.trim() });
             if !a.instructions.trim().is_empty() {
                 t.push_str(&format!("## 일하는 방식 (사용자가 정한 지침)\n{}\n\n", a.instructions.trim()));
@@ -2615,6 +2620,46 @@ fn handle(app: Arc<App>, mut req: Request) {
         return send_json(req, code, v);
     }
     match (&method, parts.as_slice()) {
+        (Method::Get, ["api", "cc", "sessions"]) => {
+            let linked: std::collections::HashSet<String> = app.inner.lock().unwrap().s.agents.iter().map(|a| a.session.clone()).filter(|x| !x.is_empty()).collect();
+            send_json(req, 200, json!({"sessions": cc_sessions(&linked)}))
+        }
+        (Method::Post, ["api", "cc", "import"]) => {
+            let sid = input["id"].as_str().unwrap_or("").to_string();
+            let Some(path) = cc_find(&sid) else { return send_json(req, 404, json!({"error": "그 대화 기록을 찾지 못했습니다."})) };
+            let (cwd, msgs) = cc_parse(&path, 40_000_000, 200, false);
+            if cwd.is_empty() || !Path::new(&cwd).is_dir() {
+                return send_json(req, 400, json!({"error": format!("이 대화를 하던 폴더({cwd})가 이 컴퓨터에 없어서 이어갈 수 없습니다.")}));
+            }
+            let mut g = app.inner.lock().unwrap();
+            if g.s.agents.iter().any(|a| a.session == sid) {
+                return send_json(req, 400, json!({"error": "이미 가져온 대화입니다."}));
+            }
+            let base: String = input["name"].as_str().map(|n| n.trim().to_string()).filter(|n| !n.is_empty())
+                .unwrap_or_else(|| msgs.iter().find(|m| m.0 == "user").map(|m| m.1.replace('\n', " ").chars().take(14).collect::<String>().trim().to_string()).unwrap_or_default());
+            let base = if base.is_empty() { "가져온 대화".to_string() } else { base.chars().take(26).collect() };
+            let mut name = base.clone();
+            let mut n = 2;
+            while g.s.agents.iter().any(|a| a.project.is_empty() && a.name.eq_ignore_ascii_case(&name)) {
+                name = format!("{base} {n}");
+                n += 1;
+            }
+            let a = app.new_agent(&mut g, &name, "Claude Code 에서 가져온 대화", "acceptEdits".to_string(), false, "", "", "");
+            let id = a.id.clone();
+            if let Some(x) = g.s.agents.iter_mut().find(|x| x.id == id) {
+                x.dir = cwd.clone();
+                x.session = sid.clone();
+                x.imported = true;
+            }
+            app.add_msg(&mut g, &id, "system", "system", &format!("Claude Code 에서 가져온 대화입니다. 작업 폴더는 {cwd} 이고, 최근 {}개 메시지만 가져왔습니다. 같은 대화를 터미널과 동시에 쓰지는 마세요.", msgs.len()));
+            for (role, text) in &msgs {
+                app.add_msg(&mut g, &id, role, "text", text);
+            }
+            let a = g.s.agents.iter().find(|x| x.id == id).cloned().unwrap();
+            app.emit_agent(&mut g, &id);
+            app.save(&g);
+            send_json(req, 200, json!({"agent": a}))
+        }
         (Method::Get, ["api", "ratelimit"]) => {
             let v: Value = std::fs::read_to_string(app.data.join("ratelimit.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(json!({"info": null}));
             send_json(req, 200, v)
@@ -3290,6 +3335,101 @@ fn handle(app: Arc<App>, mut req: Request) {
         }
         _ => send_json(req, 404, json!({"error": "not found"})),
     }
+}
+
+// ---- Claude Code 대화 가져오기 ----
+fn cc_projects_dir() -> Option<PathBuf> {
+    let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok()?;
+    Some(PathBuf::from(home).join(".claude").join("projects"))
+}
+
+fn cc_text(content: &Value) -> String {
+    match content {
+        Value::String(s) => s.clone(),
+        Value::Array(a) => a.iter().filter(|b| b["type"] == "text").filter_map(|b| b["text"].as_str()).collect::<Vec<_>>().join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// 세션 파일(jsonl)을 읽어 (작업 폴더, [(역할, 글)]) 을 돌려줍니다. 도구 호출·생각·시스템 안내문은 건너뜁니다.
+fn cc_parse(path: &Path, byte_cap: u64, want_msgs: usize, first_only: bool) -> (String, Vec<(String, String)>) {
+    use std::io::BufRead;
+    let mut cwd = String::new();
+    let mut msgs: Vec<(String, String)> = Vec::new();
+    let Ok(f) = std::fs::File::open(path) else { return (cwd, msgs) };
+    for line in std::io::BufReader::new(f.take(byte_cap)).lines().map_while(Result::ok) {
+        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        if cwd.is_empty() {
+            if let Some(c) = v["cwd"].as_str() {
+                cwd = c.to_string();
+            }
+        }
+        if v["isSidechain"] == true || v["isMeta"] == true {
+            continue;
+        }
+        let role = match v["type"].as_str() {
+            Some("user") => "user",
+            Some("assistant") => "agent",
+            _ => continue,
+        };
+        let text = cc_text(&v["message"]["content"]);
+        let t = text.trim();
+        if t.is_empty() || t.starts_with('<') || t.starts_with("Caveat:") || t.starts_with("[Request interrupted") {
+            continue;
+        }
+        let t: String = t.chars().take(6000).collect();
+        msgs.push((role.to_string(), t));
+        if first_only && !cwd.is_empty() && msgs.iter().any(|m| m.0 == "user") {
+            break;
+        }
+        if msgs.len() > want_msgs * 2 {
+            let cut = msgs.len() - want_msgs;
+            msgs.drain(..cut);
+        }
+    }
+    if msgs.len() > want_msgs {
+        let cut = msgs.len() - want_msgs;
+        msgs.drain(..cut);
+    }
+    (cwd, msgs)
+}
+
+fn cc_find(id: &str) -> Option<PathBuf> {
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return None;
+    }
+    let root = cc_projects_dir()?;
+    for d in std::fs::read_dir(root).ok()?.flatten() {
+        let p = d.path().join(format!("{id}.jsonl"));
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+fn cc_sessions(linked: &std::collections::HashSet<String>) -> Vec<Value> {
+    let mut out: Vec<(u64, Value)> = Vec::new();
+    let Some(root) = cc_projects_dir() else { return vec![] };
+    let Ok(rd) = std::fs::read_dir(root) else { return vec![] };
+    for d in rd.flatten() {
+        let Ok(files) = std::fs::read_dir(d.path()) else { continue };
+        for f in files.flatten() {
+            let p = f.path();
+            if p.extension().map_or(true, |e| e != "jsonl") {
+                continue;
+            }
+            let id = p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            let mtime = f.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_millis() as u64).unwrap_or(0);
+            let (cwd, msgs) = cc_parse(&p, 262_144, 4, true);
+            let Some(first) = msgs.iter().find(|m| m.0 == "user") else { continue };
+            let title: String = first.1.replace('\n', " ").chars().take(80).collect();
+            let exists = !cwd.is_empty() && Path::new(&cwd).is_dir();
+            out.push((mtime, json!({"id": id, "cwd": cwd, "title": title, "mtime": mtime, "exists": exists, "linked": linked.contains(&id)})));
+        }
+    }
+    out.sort_by(|a, b| b.0.cmp(&a.0));
+    out.into_iter().take(40).map(|x| x.1).collect()
 }
 
 fn pct_encode(s: &str) -> String {

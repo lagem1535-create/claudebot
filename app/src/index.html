@@ -710,6 +710,7 @@ function navView(){
       h('button',{class:'link ghost',title:S.conn.url+' · 눌러서 연결 바꾸기',onclick:()=>{S.manual=true;render()}},h('span',{class:'dot '+(S.lost?'err':'on')}),S.lost?'연결 끊김':(S.health.os==='windows'?'이 PC':S.health.os))),
     h('button',{class:'navbtn',onclick:()=>openProject()},h('span',{class:'ic','aria-hidden':'true'},'+'),'새 프로젝트'),
     h('button',{class:'navbtn',onclick:()=>openNew('')},h('span',{class:'ic','aria-hidden':'true'},'+'),'새 에이전트'),
+    h('button',{class:'navbtn',onclick:()=>openCCImport()},h('span',{class:'ic','aria-hidden':'true'},'↓'),'Claude Code 대화 가져오기'),
     h('div',{class:'list',id:'list'},
       S.projects.length?h('div',{class:'sect'},'프로젝트'):null,groups,
       loose.length?h('div',{class:'sect'},S.projects.length?'프로젝트 없음':'에이전트'):null,loose.map(itemView),
@@ -1349,6 +1350,33 @@ function openProject(){
   render();$('#p-name').focus();
 }
 
+function ccResumeBlock(a){
+  if(!a.session)return h('div',{},h('h4',{class:'sh'},'Claude Code에서 이어하기'),h('p',{class:'note'},'아직 이 에이전트의 대화 번호가 없습니다. 에이전트에게 한 번 말을 걸면 생겨요.'));
+  const win=/^[A-Za-z]:\\/.test(a.dir||'')||String(a.dir||'').includes('\\');
+  const cmd=win?`cd /d "${a.dir}" && claude --resume ${a.session}`:`cd "${a.dir}" && claude --resume ${a.session}`;
+  return h('div',{},h('h4',{class:'sh'},'Claude Code에서 이어하기'),
+    h('p',{class:'note',style:'margin:0 0 6px'},'터미널에서 아래 명령을 실행하면 이 에이전트와 나눈 대화를 Claude Code로 이어서 할 수 있어요. 앱과 터미널에서 동시에 쓰지는 마세요.'),
+    h('div',{class:'mcpbox',style:'font-family:ui-monospace,monospace;font-size:12px;word-break:break-all;user-select:all'},cmd),
+    h('div',{class:'row',style:'justify-content:flex-start;margin-top:6px'},h('button',{type:'button',onclick:async e=>{try{await navigator.clipboard.writeText(cmd);e.target.textContent='복사됨'}catch(_){e.target.textContent='길게 눌러 직접 복사하세요'}}},'명령 복사')));
+}
+function openCCImport(){
+  const st={list:null,err:''};
+  const draw=()=>{const box=$('#ccbox');if(!box)return;
+    if(st.err){box.replaceChildren(h('p',{class:'note'},st.err));return}
+    if(!st.list){box.replaceChildren(h('p',{class:'note'},'Claude Code 대화를 찾는 중…'));return}
+    if(!st.list.length){box.replaceChildren(h('p',{class:'note'},'가져올 수 있는 대화가 없습니다. 이 컴퓨터에서 Claude Code로 대화한 기록(~/.claude/projects)이 있어야 해요.'));return}
+    box.replaceChildren(...st.list.map(x=>h('div',{class:'skl',style:'display:flex;gap:10px;align-items:center;justify-content:space-between'},
+      h('div',{style:'min-width:0'},h('b',{style:'display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap'},x.title),
+        h('span',{class:'note',style:'display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap'},(x.cwd||'?')+' · '+new Date(x.mtime).toLocaleString('ko-KR',{month:'numeric',day:'numeric',hour:'2-digit',minute:'2-digit'}))),
+      x.linked?h('span',{class:'note'},'가져옴'):!x.exists?h('span',{class:'note',title:'이 컴퓨터에 그 폴더가 없어요'},'폴더 없음'):
+      h('button',{onclick:async e=>{e.target.disabled=true;e.target.textContent='가져오는 중…';try{const r=await post('/api/cc/import',{id:x.id});closeDlg();go(r.agent.id)}catch(er){e.target.disabled=false;e.target.textContent='가져오기';$('#dlgerr').textContent=er.message}}},'가져오기'))))};
+  S.dialog=()=>h('div',{class:'veil',onclick:e=>{if(e.target.classList.contains('veil'))closeDlg()}},h('div',{class:'dlg wide',role:'dialog','aria-modal':'true'},
+    h('div',{class:'dhead'},h('h3',{},'Claude Code 대화 가져오기'),h('button',{class:'ghost',onclick:closeDlg,'aria-label':'닫기'},'×')),
+    h('p',{class:'sub'},'이 컴퓨터에서 Claude Code로 한 대화를 에이전트로 가져와 이어서 합니다. 대화가 있던 폴더에서 그대로 일하고, 최근 메시지 200개를 보여 줍니다. 터미널과 앱에서 같은 대화를 동시에 쓰지는 마세요.'),
+    h('div',{class:'errline',id:'dlgerr'}),h('div',{class:'sbody',id:'ccbox'},h('p',{class:'note'},'Claude Code 대화를 찾는 중…'))));
+  render();
+  api('/api/cc/sessions').then(r=>{st.list=r.sessions||[];draw()}).catch(e=>{st.err=e.message;draw()});
+}
 function openAgentSettings(a){
   const f={style:a.style||'',mcp:new Set((a.mcp||'').split(',').map(x=>x.trim()).filter(Boolean))};
   const stTxt={ok:'연결됨',auth:'로그인 필요',fail:'연결 실패',unknown:'확인 안 됨'};
@@ -1380,6 +1408,7 @@ function openAgentSettings(a){
       h('div',{class:'row',style:'justify-content:flex-start;margin-top:6px'},h('button',{type:'button',onclick:loadMcp},'연결된 MCP 확인하고 고르기')),
       h('label',{for:'as-allow'},'추가로 허용할 도구'),h('input',{type:'text',id:'as-allow',value:a.allowed||'',placeholder:'예: Bash(git status),Bash(npm test)'}),
       h('label',{for:'as-deny'},'차단할 도구'),h('input',{type:'text',id:'as-deny',value:a.denied||'',placeholder:'예: Bash(rm *),WebFetch'}),
+      ccResumeBlock(a),
       h('div',{class:'errline',id:'dlgerr'}),
       h('div',{class:'actions'},h('button',{onclick:closeDlg},'취소'),h('button',{class:'primary',onclick:save},'저장')),
       h('h4',{class:'sh'},'관리'),h('div',{class:'path'},a.dir),
