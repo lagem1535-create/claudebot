@@ -30,12 +30,58 @@ fn read_json(p: &PathBuf) -> Option<Value> {
     serde_json::from_str(&std::fs::read_to_string(p).ok()?).ok()
 }
 
+/// "http(s)://호스트[:포트][/경로]" 에서 접속할 "호스트:포트"를 뽑습니다. 포트가 없으면 http=80, https=443.
+fn host_port(url: &str) -> String {
+    let (https, rest) = match url.strip_prefix("https://") {
+        Some(r) => (true, r),
+        None => (false, url.strip_prefix("http://").unwrap_or(url)),
+    };
+    let host = rest.split('/').next().unwrap_or("").trim();
+    if host.contains(':') {
+        host.to_string()
+    } else {
+        format!("{host}:{}", if https { 443 } else { 80 })
+    }
+}
+
 fn reachable(url: &str) -> bool {
-    let host = url.trim_start_matches("http://").trim_end_matches('/');
-    let host = if host.contains(':') { host.to_string() } else { format!("{host}:80") };
+    let host = host_port(url);
     match host.to_socket_addrs() {
         Ok(mut addrs) => addrs.next().map(|a| TcpStream::connect_timeout(&a, Duration::from_millis(900)).is_ok()).unwrap_or(false),
         Err(_) => false,
+    }
+}
+
+/// 사용자가 적은 주소를 정리합니다. 스킴이 없으면 http, http 인데 포트가 없으면 실행기 기본 포트 7717 을 붙입니다.
+/// https(Cloudflare 터널 등)는 포트를 건드리지 않습니다.
+fn normalize_url(raw: &str) -> String {
+    let mut u = raw.trim().trim_end_matches('/').to_string();
+    if !u.starts_with("http://") && !u.starts_with("https://") {
+        u = format!("http://{u}");
+    }
+    if u.starts_with("http://") && !host_port_has_port(&u) {
+        u.push_str(":7717");
+    }
+    u
+}
+
+fn host_port_has_port(url: &str) -> bool {
+    let rest = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://")).unwrap_or(url);
+    rest.split('/').next().unwrap_or("").contains(':')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn urls() {
+        assert_eq!(normalize_url("192.168.0.5"), "http://192.168.0.5:7717");
+        assert_eq!(normalize_url("http://192.168.0.5:7717/"), "http://192.168.0.5:7717");
+        assert_eq!(normalize_url("https://abc-def.trycloudflare.com"), "https://abc-def.trycloudflare.com");
+        assert_eq!(normalize_url("https://abc-def.trycloudflare.com/"), "https://abc-def.trycloudflare.com");
+        assert_eq!(host_port("https://abc-def.trycloudflare.com"), "abc-def.trycloudflare.com:443");
+        assert_eq!(host_port("http://10.0.0.2:7717"), "10.0.0.2:7717");
+        assert_eq!(host_port("http://10.0.0.2"), "10.0.0.2:80");
     }
 }
 
@@ -143,7 +189,7 @@ fn main() {
                 let mut body = String::new();
                 let _ = req.as_reader().take(10_000).read_to_string(&mut body);
                 let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-                let mut u = v["url"].as_str().unwrap_or("").trim().trim_end_matches('/').to_string();
+                let u = v["url"].as_str().unwrap_or("").trim().to_string();
                 let code = v["code"].as_str().unwrap_or("").trim().to_string();
                 if u.is_empty() {
                     let _ = std::fs::remove_file(data.join("app.json")); // back to this PC's runner
@@ -151,12 +197,7 @@ fn main() {
                     reply(req, json!({"ok": true}));
                     continue;
                 }
-                if !u.starts_with("http://") && !u.starts_with("https://") {
-                    u = format!("http://{u}");
-                }
-                if u.matches(':').count() < 2 {
-                    u.push_str(":7717");
-                }
+                let u = normalize_url(&u);
                 let _ = std::fs::write(data.join("app.json"), json!({"url": u, "token": code}).to_string());
                 reply(req, json!({"ok": true}));
             }

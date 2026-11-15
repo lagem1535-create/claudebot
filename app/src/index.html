@@ -672,7 +672,7 @@ function connectView(){
   return h('div',{class:'veil',style:'background:var(--bg)'},h('div',{class:'dlg'},
     h('h3',{},title),h('p',{class:'sub'},body),
     h('details',{open:remote||S.manual||n==='bad-code'},h('summary',{style:'cursor:pointer;color:var(--muted)'},'다른 컴퓨터(VM)의 실행기에 연결'),
-      h('label',{for:'c-url'},'실행기 주소'),h('input',{type:'text',id:'c-url',placeholder:'예: 172.20.5.12',value:remote?S.conn.url:''}),
+      h('label',{for:'c-url'},'실행기 주소'),h('input',{type:'text',id:'c-url',placeholder:'예: 172.20.5.12 또는 https://….trycloudflare.com',value:remote?S.conn.url:''}),
       h('label',{for:'c-code'},'연결 코드'),h('input',{type:'text',id:'c-code',placeholder:'실행기 창에 표시된 코드',value:remote?S.conn.token:''}),
       h('div',{class:'actions'},
         S.manual&&h('button',{class:'ghost',onclick:()=>{S.manual=false;render()}},'취소'),
