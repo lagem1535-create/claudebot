@@ -936,9 +936,44 @@ fn scope_clean(scope: &str) -> String {
     if t.is_empty() || t == "all" { "all".into() } else { t }
 }
 
+/// 브라우저 프로필(Chromium 이 쓰는 폴더)을 둘 곳입니다.
+/// Chromium 은 프로필 안에 심볼릭 링크(SingletonLock)를 만들어야 하는데, 안드로이드 내장 메모리처럼 링크를 못 만드는 곳에서는
+/// "Browser is already in use" 로 실패합니다. 그래서 데이터 폴더에서 링크가 안 만들어지면 홈 폴더로 자동 옮깁니다.
+/// 직접 정하려면 환경변수 CLAUDEBOT_BROWSER_DIR 를 쓰세요.
+fn browser_base(data: &Path) -> PathBuf {
+    static BASE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BASE.get_or_init(|| {
+        if let Ok(d) = std::env::var("CLAUDEBOT_BROWSER_DIR") {
+            if !d.trim().is_empty() {
+                let p = PathBuf::from(d.trim());
+                let _ = std::fs::create_dir_all(&p);
+                return p;
+            }
+        }
+        #[cfg(unix)]
+        {
+            let probe = data.join(".symlink_probe");
+            let _ = std::fs::remove_file(&probe);
+            let ok = std::os::unix::fs::symlink("probe", &probe).is_ok();
+            let _ = std::fs::remove_file(&probe);
+            if !ok {
+                if let Ok(home) = std::env::var("HOME") {
+                    let p = PathBuf::from(home).join(".claudebot-browser");
+                    if std::fs::create_dir_all(&p).is_ok() {
+                        return p;
+                    }
+                }
+            }
+        }
+        data.to_path_buf()
+    })
+    .clone()
+}
+
 fn login_profile(app: &App, scope: &str) -> PathBuf {
     let sc = scope_clean(scope);
-    if sc == "all" { app.data.join("browser_login") } else { app.data.join(format!("browser_login_{sc}")) }
+    let base = browser_base(&app.data);
+    if sc == "all" { base.join("browser_login") } else { base.join(format!("browser_login_{sc}")) }
 }
 
 fn login_stop(app: &App) -> bool {
@@ -1970,7 +2005,7 @@ impl App {
         let _ = Command::new("Xvfb").args([&disp, "-screen", "0", "1280x720x24", "-nolisten", "tcp"])
             .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
         std::thread::sleep(Duration::from_millis(600));
-        decorate_display(&self.data, &disp, Some(&self.data.join(format!("browser_{id}"))));
+        decorate_display(&self.data, &disp, Some(&browser_base(&self.data).join(format!("browser_{id}"))));
     }
 
     fn run_job(self: &Arc<Self>, id: &str, job: Job) {
@@ -2052,7 +2087,7 @@ impl App {
         cmd.arg("--add-dir").arg(assist::md_dir(self));
         let mut allowed = String::from("WebSearch,WebFetch");
         if agent.browser {
-            let profile = self.data.join(format!("browser_{id}"));
+            let profile = browser_base(&self.data).join(format!("browser_{id}"));
             sync_login_profile(self, &profile, &agent.project);
             let mut args = vec![json!("-y"), json!("@playwright/mcp@latest"), json!("--user-data-dir"), json!(profile.to_string_lossy()), json!("--browser"), json!("chromium"), json!("--viewport-size"), json!("1280,720")];
             if cfg!(unix) { args.push(json!("--no-sandbox")); }
