@@ -85,6 +85,10 @@ mod tests {
     }
 }
 
+static RUNNER: std::sync::Mutex<Option<std::process::Child>> = std::sync::Mutex::new(None);
+static RUNNER_INFO: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Starts the runner next to this exe. Returns false if the file is missing.
 fn start_runner() -> bool {
     let Ok(exe) = std::env::current_exe() else { return false };
     let name = if cfg!(windows) { "claudebot-runner.exe" } else { "claudebot-runner" };
@@ -92,13 +96,33 @@ fn start_runner() -> bool {
     if !path.is_file() {
         return false;
     }
-    let mut c = Command::new(path);
+    let mut c = Command::new(&path);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         c.creation_flags(0x0000_0010); // its own console window
     }
-    c.spawn().is_ok()
+    match c.spawn() {
+        Ok(ch) => {
+            *RUNNER.lock().unwrap() = Some(ch);
+            *RUNNER_INFO.lock().unwrap() = String::new();
+            true
+        }
+        Err(e) => {
+            *RUNNER_INFO.lock().unwrap() = format!("실행기를 시작하지 못했습니다: {e}");
+            true
+        }
+    }
+}
+
+/// If the runner we started has already exited, returns a description (and forgets it).
+fn runner_exited() -> Option<String> {
+    let mut g = RUNNER.lock().unwrap();
+    let st = g.as_mut()?.try_wait().ok().flatten()?;
+    *g = None;
+    let msg = format!("실행기가 바로 꺼졌습니다 (종료 코드 {}).", st.code().map(|c| c.to_string()).unwrap_or_else(|| "?".into()));
+    *RUNNER_INFO.lock().unwrap() = msg.clone();
+    Some(msg)
 }
 
 fn open_browser(url: &str) {
@@ -133,6 +157,7 @@ fn main() {
     let data = data_dir();
     let _ = std::fs::create_dir_all(&data);
     let launched = Arc::new(AtomicBool::new(false));
+    let last_try = AtomicU64::new(0);
     let last_ping = Arc::new(AtomicU64::new(0));
     {
         let last_ping = last_ping.clone();
@@ -181,9 +206,15 @@ fn main() {
                     } else {
                         note = "starting";
                         up = false;
+                        // The runner we started died: say so, and try again at most every 10 seconds.
+                        if runner_exited().is_some() && now().saturating_sub(last_try.load(Ordering::Relaxed)) > 10_000 {
+                            last_try.store(now(), Ordering::Relaxed);
+                            start_runner();
+                        }
                     }
                 }
-                reply(req, json!({"url": u, "token": t, "reachable": up, "remote": is_remote, "note": note}));
+                let info = RUNNER_INFO.lock().unwrap().clone();
+                reply(req, json!({"url": u, "token": t, "reachable": up, "remote": is_remote, "note": note, "info": info}));
             }
             (Method::Post, "/app/conn") => {
                 let mut body = String::new();
