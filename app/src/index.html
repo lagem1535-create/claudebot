@@ -537,7 +537,15 @@ async function connect(){
   }
   S.connNote='';S.lost=false;
   api('/api/update').then(r=>{S.upd=r;render()}).catch(()=>{});
-  await loadState();render();loadAssist();maybeDigest();poll();
+  await loadState();render();loadAssist();maybeDigest();poll();setTimeout(askCCImport,1500);
+}
+// 처음 한 번만: Claude Code 대화가 있으면 가져올지 물어봅니다. (대답은 실행기에 기억됩니다)
+async function askCCImport(){
+  if(S.ccAsked)return;S.ccAsked=true;
+  let r;try{r=await api('/api/cc/pending')}catch(e){return}
+  if(!r.pending||r.auto.asked||r.auto.last||S.dialog)return;
+  const done=()=>post('/api/cc/asked',{}).catch(()=>{});
+  confirmDo('Claude Code 대화를 가져올까요?',`이 컴퓨터에서 Claude Code로 나눈 대화 ${r.pending}개를 찾았어요. 가져오면 대화마다 에이전트가 하나씩 생기고, 여기서 이어서 할 수 있어요. 원래 기록과 폴더는 그대로 둡니다. 지금 안 가져와도 왼쪽의 "Claude Code 대화 가져오기"에서 언제든 골라서 가져올 수 있어요.`,'가져오기',async()=>{await post('/api/cc/update',{});await done();await loadState()},done);
 }
 async function loadState(){
   const st=await api('/api/state');

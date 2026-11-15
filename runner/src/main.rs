@@ -2632,6 +2632,15 @@ fn handle(app: Arc<App>, mut req: Request) {
                 Err(e) => send_json(req, 400, json!({"error": e})),
             }
         }
+        (Method::Get, ["api", "cc", "pending"]) => {
+            send_json(req, 200, json!({"pending": cc_pending(&app).len(), "auto": cc_auto_view(&app.data)}))
+        }
+        (Method::Post, ["api", "cc", "asked"]) => {
+            let mut c = cc_auto_load(&app.data);
+            c.asked = true;
+            cc_auto_store(&app.data, &c);
+            send_json(req, 200, json!({"ok": true}))
+        }
         (Method::Post, ["api", "cc", "update"]) => {
             let (imported, refreshed) = cc_update(&app);
             send_json(req, 200, json!({"imported": imported, "refreshed": refreshed, "auto": cc_auto_view(&app.data)}))
@@ -3478,6 +3487,8 @@ struct CcAuto {
     #[serde(default)]
     count: u64,
     #[serde(default)]
+    asked: bool, // 처음에 "가져올까요?" 를 이미 물어봤는지
+    #[serde(default)]
     known: Vec<String>, // 이미 가져왔거나 이 앱이 만든 대화 번호 (다시 가져오지 않음)
 }
 
@@ -3495,7 +3506,7 @@ fn cc_auto_store(data: &Path, c: &CcAuto) {
 
 fn cc_auto_view(data: &Path) -> Value {
     let c = cc_auto_load(data);
-    json!({"on": c.on, "minutes": c.minutes, "since": c.since, "last": c.last, "count": c.count})
+    json!({"last": c.last, "count": c.count, "asked": c.asked})
 }
 
 /// 20초마다 불립니다. 이 앱의 에이전트가 쓰는 대화 번호를 기억해 두고, 켜져 있으면 주기에 맞춰 새 대화를 가져옵니다.
@@ -3524,6 +3535,22 @@ fn cc_auto_tick(app: &App) {
         cc_auto_store(&app.data, &c);
     }
     let _ = (own_dirs, busy_dirs);
+}
+
+/// 아직 안 가져왔고 가져올 수 있는 대화 번호들 (폴더가 있고, 이 앱이 스스로 만든 대화가 아닌 것).
+fn cc_pending(app: &App) -> Vec<String> {
+    let (mut known, own_dirs): (HashSet<String>, Vec<PathBuf>) = {
+        let g = app.inner.lock().unwrap();
+        (
+            g.s.agents.iter().map(|a| a.session.clone()).filter(|x| !x.is_empty()).collect(),
+            g.s.agents.iter().filter(|a| !a.imported).map(|a| PathBuf::from(&a.dir)).chain(g.s.projects.iter().map(|p| PathBuf::from(&p.dir))).collect(),
+        )
+    };
+    known.extend(cc_auto_load(&app.data).known);
+    cc_sessions(&known, 200).into_iter().filter(|sv| {
+        let cp = Path::new(sv["cwd"].as_str().unwrap_or(""));
+        sv["linked"] != true && sv["exists"] == true && !cp.starts_with(&app.work) && !cp.starts_with(&app.data) && !own_dirs.iter().any(|d| cp.starts_with(d))
+    }).filter_map(|sv| sv["id"].as_str().map(String::from)).collect()
 }
 
 /// "모든 대화 가져오기 / 업데이트" 버튼: 아직 안 가져온 대화를 모두 가져오고, 이미 가져온 대화에 터미널에서 더해진 메시지를 채팅에 덧붙입니다.
@@ -3568,18 +3595,10 @@ fn cc_update(app: &App) -> (u64, u64) {
         app.save(&g);
     }
     // 2) 아직 안 가져온 대화 모두 가져오기 (이 앱이 스스로 만든 대화는 제외)
-    let known: HashSet<String> = c.known.iter().cloned().collect();
+    let _ = (&c, &own_dirs);
     let mut imported = 0u64;
-    for sv in cc_sessions(&known, 200) {
-        let (sid, cwd) = (sv["id"].as_str().unwrap_or(""), sv["cwd"].as_str().unwrap_or(""));
-        if sv["linked"] == true || sv["exists"] != true {
-            continue;
-        }
-        let cp = Path::new(cwd);
-        if cp.starts_with(&app.work) || cp.starts_with(&app.data) || own_dirs.iter().any(|d| cp.starts_with(d)) {
-            continue;
-        }
-        if cc_import(app, sid, "").is_ok() {
+    for sid in cc_pending(app) {
+        if cc_import(app, &sid, "").is_ok() {
             imported += 1;
         }
     }
