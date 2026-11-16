@@ -1606,6 +1606,18 @@ fn dbus_env(cmd: &mut Command, disp: &str) {
     }
 }
 
+/// 가상 화면을 꾸미는 프로그램 중 없는 것 (없으면 화면이 까맣거나 창을 움직일 수 없습니다).
+fn desk_missing() -> Vec<&'static str> {
+    if !cfg!(unix) {
+        return vec![];
+    }
+    [("openbox", "openbox"), ("pcmanfm", "pcmanfm"), ("tint2", "tint2"), ("xdotool", "xdotool")]
+        .into_iter()
+        .filter(|(bin, _)| which(&[bin]).is_none())
+        .map(|(_, pkg)| pkg)
+        .collect()
+}
+
 fn decorate_display(data: &Path, disp: &str, browser_profile: Option<&Path>) {
     let dnum = disp.trim_start_matches(':').to_string();
     // 앱들이 서로 통신할 수 있게 화면마다 세션 버스를 켭니다 (달력 같은 앱에 필요).
@@ -1703,6 +1715,9 @@ fn decorate_display(data: &Path, disp: &str, browser_profile: Option<&Path>) {
     }
     if wall.exists() && which(&["feh"]).is_some() {
         let _ = Command::new("feh").env("DISPLAY", disp).arg("--bg-fill").arg(&wall).status();
+    } else if wall.exists() && which(&["display"]).is_some() {
+        // feh 가 없으면 ImageMagick 으로 배경을 칠합니다 (화면 캡처에 쓰는 것과 같은 꾸러미라 늘 있습니다).
+        let _ = Command::new("display").env("DISPLAY", disp).args(["-window", "root"]).arg(&wall).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
     } else if which(&["xsetroot"]).is_some() {
         let _ = Command::new("xsetroot").env("DISPLAY", disp).args(["-solid", "#c9683a"]).status();
     }
@@ -2664,7 +2679,8 @@ fn handle(app: Arc<App>, mut req: Request) {
         }
         (Method::Get, ["api", "health"]) => send_json(req, 200, json!({
             "ok": true, "claude": app.claude.is_some(), "version": app.version, "app_version": APP_VERSION, "os": std::env::consts::OS,
-            "screens": app.screens, "work": app.work.to_string_lossy(), "vnc": vnc_ok(), "vnc_port": VNC_PORT.load(std::sync::atomic::Ordering::Relaxed)
+            "screens": app.screens, "work": app.work.to_string_lossy(), "vnc": vnc_ok(), "vnc_port": VNC_PORT.load(std::sync::atomic::Ordering::Relaxed),
+            "desk_missing": desk_missing()
         })),
         (Method::Get, ["api", "mcp-live"]) => match &app.claude {
             Some(c) => {

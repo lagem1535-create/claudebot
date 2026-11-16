@@ -384,6 +384,8 @@ button:active{transform:scale(.98)}
 .stabs button.on{box-shadow:inset 0 0 0 1px var(--line)}
 .srow{padding:10px 0}
 .hamb{display:none;font-size:18px;padding:4px 9px;margin-left:-8px}
+.compbtn{display:none}
+@media (max-width:1040px){.compbtn{display:inline-flex}}
 .navback{display:none}
 .compose{padding-bottom:calc(12px + env(safe-area-inset-bottom,0px))}
 @media (max-width:1040px){.pet{display:none!important}}
@@ -406,6 +408,9 @@ button:active{transform:scale(.98)}
   .dlg.wide{width:100%}
   .stabs{margin-left:-4px}
   .zbar{flex-wrap:wrap}
+  .zoom .zbar{padding:8px 10px;gap:6px}
+  .zoom .zbar b{flex-basis:100%;margin:0}
+  .zoom .zbar button{padding:6px 10px;font-size:13px}
 }
 @media (hover:none){button{min-height:36px}.px{min-height:30px}}
 .srcs{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 2px;align-items:center}
@@ -919,6 +924,7 @@ function chatView(a){
       picker({label:a.actual_model?'모델 (지금 쓰이는 모델: '+a.actual_model+')':'모델',cls:'right',text:(MODELS.find(m=>m[0]===a.model)||[0,a.model])[1].replace('모델: ',''),val:a.model,
         groups:[{title:'모델',items:MODELS.map(([v,t])=>[v,t.replace('모델: ',''),MODEL_D[v]])},{title:'생각 깊이',items:[]}].slice(0,1),
         onpick:v=>upd({model:v}),extra:[['직접 입력…',()=>askModel(a)]]}),
+      h('button',{class:'ghost compbtn',title:'에이전트의 컴퓨터 보기',onclick:()=>openZoom(a,hasScreen(a)&&S.deskMode==='real'?'screen':'desk')},'컴퓨터'),
       h('button',{class:'ghost',onclick:()=>openAgentSettings(a)},'에이전트 설정'),
       h('span',{class:'note',id:'headstate'},headState(a))),
     h('div',{id:'prog',class:'progwrap'},progressBox(a)),
@@ -1145,7 +1151,7 @@ function deskPane(a){
   if(hasScreen(a)&&S.deskMode==='real'){
     const seg=h('div',{class:'row',style:'justify-content:space-between;align-items:center;margin-bottom:8px'},h('span',{class:'row',style:'gap:6px'},h('button',{onclick:()=>{S.deskMode='sim';render()}},'데스크톱'),h('button',{class:'primary'},'실제 화면')),h('button',{onclick:()=>openZoom(a,'screen')},'크게 보기'));
     const img=h('img',{id:'liveimg',alt:`${a.name}의 실제 화면`,src:screenUrl(a),style:'display:block;width:100%;aspect-ratio:16/9;object-fit:contain;background:#1f1e1d'});
-    return h('div',{},seg,h('div',{class:'deskwrap',style:'cursor:zoom-in',onclick:()=>openZoom(a,'screen')},img),h('p',{class:'note',style:'margin-top:8px'},`Linux 가상 화면 :${a.display} 을 3초마다 새로 찍어 보여 줍니다. Chromium도 여기서 열립니다.`));
+    return h('div',{},seg,h('div',{class:'deskwrap',style:'cursor:zoom-in',onclick:()=>openZoom(a,'screen')},img),h('p',{class:'note',style:'margin-top:8px'},`Linux 가상 화면 :${a.display} 을 몇 초마다 새로 찍어 보여 줍니다. 에이전트가 쓰는 Chromium은 작업하는 동안에만 이 화면에 열리고, 작업이 끝나면 닫힙니다.`),deskMissingNote());
   }
   const wrap=h('div',{class:'deskwrap','data-agent':a.id,role:'button',tabindex:0,title:'눌러서 크게 보기','aria-label':`${a.name}의 컴퓨터 크게 보기`,onclick:()=>openZoom(a,'desk'),onkeydown:e=>{if(e.key==='Enter')openZoom(a,'desk')}},deskEl(a,false));
   return h('div',{},wrap,
@@ -1153,6 +1159,12 @@ function deskPane(a){
       h('span',{class:'note'},'에이전트가 쓰는 프로그램이 창으로 열립니다'),
       h('span',{class:'row',style:'gap:6px'},hasScreen(a)?h('button',{onclick:()=>{S.deskMode='real';render()}},'실제 화면'):null,h('button',{onclick:()=>openZoom(a,'desk')},'크게 보기'))),
     h('p',{class:'note',style:'margin-top:10px'},hasScreen(a)?`이 에이전트에게는 실제 가상 화면(:${a.display})도 있습니다. "실제 화면"을 누르면 그 화면을 그대로 봅니다.`:'에이전트가 하는 일을 데스크톱 모습으로 그려서 보여 줍니다. 크게 보기에서는 창을 끌어 옮기고, 닫고, 아래 막대에서 다시 열 수 있습니다.'));
+}
+function deskMissingNote(){
+  const m=S.health?.desk_missing||[];if(!m.length)return null;
+  return h('div',{class:'mcpbox',style:'margin-top:8px;font-size:12.5px'},h('b',{},'화면 프로그램이 일부 없어요'),
+    h('span',{class:'note'},'없으면 실제 화면이 까맣게 보이거나 창을 움직일 수 없어요. 실행기를 돌리는 컴퓨터(우분투)에서 아래를 입력한 뒤 실행기를 다시 켜 주세요.'),
+    h('code',{style:'user-select:all;overflow-wrap:anywhere'},`apt install -y ${m.join(' ')}`));
 }
 function filesPane(a){
   const data=S.files[a.id];if(!data)return h('p',{class:'note'},'불러오는 중…');
@@ -1208,6 +1220,7 @@ function openZoom(a,mode){
   const vnc=real&&S.health&&S.health.vnc;
   const inner=vnc?h('iframe',{class:'zvnc',id:'zoomvnc',title:`${a.name}의 실제 화면`,allow:'clipboard-read; clipboard-write',src:vncUrl(a)}):h('div',{class:'zinner'},real?h('img',{id:'zoomimg',alt:`${a.name}의 실제 화면`,draggable:'false',onload:e=>{if(!e.target.dataset.fit){e.target.dataset.fit=1;zFit()}}}):deskEl(a,true));
   const view=h('div',{class:'zview'},inner);
+  if(real&&!vnc&&(S.health?.desk_missing||[]).length){const n=deskMissingNote();n.style.cssText+=';position:absolute;left:12px;right:12px;bottom:12px;background:#2a2a31;color:#ececf1;padding:10px 12px;border-radius:10px;z-index:2';view.append(n)}
   Z.el=h('div',{class:'zoom',role:'dialog','aria-modal':'true','aria-label':'컴퓨터 크게 보기'},
     h('div',{class:'zbar'},h('b',{},`${a.name}의 컴퓨터`),
       vnc?h('span',{class:'note',style:'margin:0 6px'},'VNC 실시간'):null,
@@ -1218,14 +1231,21 @@ function openZoom(a,mode){
   view.addEventListener('wheel',e=>{e.preventDefault();zSet(Z.s*(e.deltaY<0?1.12:1/1.12))},{passive:false});
   let drag=null;
   const sendIn=async b=>{try{await post(`/api/agents/${a.id}/input`,b)}catch(x){const m=$('#zctlmsg');if(m)m.textContent=x.message}};
-  view.addEventListener('pointerdown',e=>{if(Z.ctl&&e.target.id==='zoomimg'){const im=e.target,r=im.getBoundingClientRect();sendIn({type:'click',x:Math.round((e.clientX-r.left)/r.width*(im.naturalWidth||1280)),y:Math.round((e.clientY-r.top)/r.height*(im.naturalHeight||720))});setTimeout(()=>{const n=new Image();n.onload=()=>{im.src=n.src};n.src=screenUrl(a)},400);return}if(e.target.closest('.win,.bar'))return;drag={x:e.clientX-Z.x,y:e.clientY-Z.y};view.classList.add('drag');view.setPointerCapture(e.pointerId)});
-  view.addEventListener('pointermove',e=>{if(!drag)return;Z.x=e.clientX-drag.x;Z.y=e.clientY-drag.y;zApply()});
+  view.addEventListener('pointerdown',e=>{if(Z.ctl&&e.target.id==='zoomimg'){const im=e.target,r=im.getBoundingClientRect();sendIn({type:'click',x:Math.round((e.clientX-r.left)/r.width*(im.naturalWidth||1280)),y:Math.round((e.clientY-r.top)/r.height*(im.naturalHeight||720))});setTimeout(()=>{const n=new Image();n.onload=()=>{im.src=n.src};n.src=screenUrl(a)},400);return}if(pinch||e.target.closest('.win,.bar'))return;drag={x:e.clientX-Z.x,y:e.clientY-Z.y};view.classList.add('drag');view.setPointerCapture(e.pointerId)});
+  view.addEventListener('pointermove',e=>{if(!drag||pinch)return;Z.x=e.clientX-drag.x;Z.y=e.clientY-drag.y;zApply()});
   const up=()=>{drag=null;view.classList.remove('drag')};view.addEventListener('pointerup',up);view.addEventListener('pointercancel',up);
   if(real&&Z.ctl&&!vnc){const ti=h('input',{type:'text',id:'zctltext',placeholder:'여기에 쓰고 전송 (화면에서 칸을 먼저 눌러 두세요)',style:'flex:1;min-width:120px',onkeydown:e=>{if(e.key==='Enter'){e.preventDefault();go1()}}});
     const go1=async()=>{const t=ti.value;if(!t)return;await sendIn({type:'type',text:t});ti.value='';setTimeout(()=>{const n=new Image();n.onload=()=>{$('#zoomimg').src=n.src};n.src=screenUrl(a)},400)};
     const kb=(l,k)=>h('button',{onclick:async()=>{await sendIn({type:'key',key:k});setTimeout(()=>{const n=new Image();n.onload=()=>{$('#zoomimg').src=n.src};n.src=screenUrl(a)},400)}},l);
     Z.el.append(h('div',{class:'zbar',style:'flex-wrap:wrap;gap:6px'},ti,h('button',{class:'primary',onclick:go1},'전송'),kb('Enter','Return'),kb('Tab','Tab'),kb('Esc','Escape'),kb('지우기','BackSpace'),kb('↑','Up'),kb('↓','Down'),kb('뒤로','alt+Left'),h('span',{id:'zctlmsg',class:'note'},'')))}
+  // 두 손가락으로 확대·축소, 한 손가락으로 이동
+  const pts=new Map();let pinch=null;
+  view.addEventListener('pointerdown',e=>{pts.set(e.pointerId,{x:e.clientX,y:e.clientY});if(pts.size===2){const[p1,p2]=[...pts.values()];pinch={d:Math.hypot(p1.x-p2.x,p1.y-p2.y),s:Z.s};drag=null}},true);
+  view.addEventListener('pointermove',e=>{if(!pts.has(e.pointerId))return;pts.set(e.pointerId,{x:e.clientX,y:e.clientY});if(pinch&&pts.size===2){const[p1,p2]=[...pts.values()];const d=Math.hypot(p1.x-p2.x,p1.y-p2.y);if(pinch.d>10)zSet(pinch.s*d/pinch.d)}},true);
+  const pend=e=>{pts.delete(e.pointerId);if(pts.size<2)pinch=null};
+  view.addEventListener('pointerup',pend,true);view.addEventListener('pointercancel',pend,true);
   document.body.append(Z.el);
+  if(!vnc){const fitOnce=()=>{if(Z.el)zFit()};requestAnimationFrame(fitOnce);if(real){const im=$('#zoomimg');if(im)im.addEventListener('load',function f(){im.removeEventListener('load',f);fitOnce()})}}
   if(real&&!vnc){$('#zoomimg').src=screenUrl(a);Z.tm=setInterval(()=>{const im=$('#zoomimg');if(!Z.el||!im||Z.agent!==a.id||Z.mode!=='screen'){clearInterval(Z.tm);return}const n=new Image();n.onload=()=>{if($('#zoomimg'))$('#zoomimg').src=n.src};n.src=screenUrl(a)},1500)}else requestAnimationFrame(zFit);
   zApply();
 }
