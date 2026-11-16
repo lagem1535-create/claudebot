@@ -1732,6 +1732,34 @@ fn decorate_display(data: &Path, disp: &str, browser_profile: Option<&Path>) {
     }
 }
 
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    let val = |c: u8| -> Option<u32> {
+        Some(match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return None,
+        } as u32)
+    };
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let (mut buf, mut bits) = (0u32, 0u32);
+    for &c in s.as_bytes() {
+        if c == b'=' || c.is_ascii_whitespace() {
+            continue;
+        }
+        buf = (buf << 6) | val(c)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
 fn random_code() -> String {
     use std::hash::{BuildHasher, Hasher};
     let alphabet = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
@@ -2011,6 +2039,50 @@ impl App {
         let ok = g.senders.get(id).map(|tx| tx.send(job).is_ok()).unwrap_or(false);
         self.emit_agent(g, id);
         ok
+    }
+
+    /// 브라우저 도구가 끝날 때마다 그 순간의 웹 페이지 모습을 저장해, 데스크톱의 브라우저 창에 보여 줍니다.
+    fn web_shot(self: &Arc<Self>, agent: &str, display: u32, mid: u64, img_b64: Option<String>) {
+        let app = self.clone();
+        let agent = agent.to_string();
+        std::thread::spawn(move || {
+            let dir = app.data.join("shots").join(&agent);
+            let _ = std::fs::create_dir_all(&dir);
+            let file = dir.join(format!("{mid}.png"));
+            let mut ok = false;
+            if let Some(b) = img_b64.and_then(|b| b64_decode(&b)) {
+                ok = std::fs::write(&file, b).is_ok();
+            }
+            if !ok && app.screens && display > 0 {
+                std::thread::sleep(Duration::from_millis(900));
+                // 브라우저 창이 실제로 떠 있을 때만 찍습니다 (없으면 빈 배경만 찍히므로).
+                let disp = format!(":{display}");
+                let has_win = match which(&["xdotool"]) {
+                    Some(_) => Command::new("xdotool").env("DISPLAY", &disp).args(["search", "--onlyvisible", "--class", "chrom"]).output().map(|o| !o.stdout.is_empty()).unwrap_or(false),
+                    None => true,
+                };
+                if has_win {
+                    if let Ok(o) = Command::new("import").args(["-display", &disp, "-window", "root", "png:-"]).output() {
+                        if o.status.success() && !o.stdout.is_empty() {
+                            ok = std::fs::write(&file, o.stdout).is_ok();
+                        }
+                    }
+                }
+            }
+            if ok {
+                // 오래된 사진은 최근 40장만 남깁니다.
+                if let Ok(rd) = std::fs::read_dir(&dir) {
+                    let mut v: Vec<(u64, PathBuf)> = rd.flatten().filter_map(|e| e.file_name().to_str()?.strip_suffix(".png")?.parse().ok().map(|n| (n, e.path()))).collect();
+                    v.sort();
+                    let n = v.len();
+                    for (_, p) in v.into_iter().take(n.saturating_sub(40)) {
+                        let _ = std::fs::remove_file(p);
+                    }
+                }
+                let mut g = app.inner.lock().unwrap();
+                app.upd_msg(&mut g, &agent, |m| m.id == mid, |m| m.data["shot"] = json!(true));
+            }
+        });
     }
 
     fn start_screen(&self, id: &str) {
@@ -2308,12 +2380,20 @@ impl App {
                             _ => String::new(),
                         };
                         let is_err = block["is_error"].as_bool().unwrap_or(false);
+                        // 브라우저(Playwright)가 돌려준 그림이 있으면 꺼내 둡니다.
+                        let img_b64: Option<String> = block["content"].as_array().and_then(|parts| {
+                            parts.iter().find(|p| p["type"] == "image").and_then(|p| p["source"]["data"].as_str().or(p["data"].as_str()).map(String::from))
+                        });
                         let mut g = self.inner.lock().unwrap();
+                        let mut shot_for: Option<u64> = None;
                         let mut found: Vec<Value> = Vec::new();
                         self.upd_msg(&mut g, id, |m| m.kind == "tool" && m.data["id"] == tid, |m| {
                             m.data["result"] = json!(trunc(&text, 6000));
                             m.data["is_error"] = json!(is_err);
                             let nm = m.data["name"].as_str().unwrap_or("").to_string();
+                            if !is_err && nm.starts_with("mcp__playwright") {
+                                shot_for = Some(m.id);
+                            }
                             if !is_err && (nm == "WebSearch" || nm == "WebFetch") {
                                 found = extract_sources(&nm, &m.data["input"], &text);
                                 if !found.is_empty() {
@@ -2321,6 +2401,10 @@ impl App {
                                 }
                             }
                         });
+                        drop(g);
+                        if let Some(mid) = shot_for {
+                            self.web_shot(&agent.id, agent.display, mid, img_b64);
+                        }
                         for f in found {
                             if !turn_src.iter().any(|o| o["url"] == f["url"]) && turn_src.len() < 20 {
                                 turn_src.push(f);
@@ -3333,6 +3417,13 @@ fn handle(app: Arc<App>, mut req: Request) {
                             Err(_) => send_json(req, 404, json!({"error": "파일을 읽지 못했습니다."})),
                         },
                         _ => send_json(req, 404, json!({"error": "파일이 없습니다."})),
+                    }
+                }
+                "shot" => {
+                    let mid: u64 = q.get("m").and_then(|x| x.parse().ok()).unwrap_or(0);
+                    match std::fs::read(app.data.join("shots").join(&agent.id).join(format!("{mid}.png"))) {
+                        Ok(b) => respond(req, 200, "image/png", b),
+                        Err(_) => send_json(req, 404, json!({"error": "no-shot"})),
                     }
                 }
                 "screen" => {

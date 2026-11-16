@@ -280,6 +280,8 @@ details.think div{white-space:pre-wrap;border-left:2px solid var(--line);padding
 .bar .tray{position:absolute;right:14px;text-align:right;font-size:11.5px;line-height:1.25;color:#cfcabb}
 .bar .who{position:absolute;left:14px;font-size:12px;margin:0;color:#cfcabb}
 /* zoom viewer */
+.shotpage{padding:0!important;background:#fff}
+.webshot{display:block;width:100%;height:auto}
 .zoom{position:fixed;inset:0;background:rgba(10,10,14,.94);z-index:20;display:flex;flex-direction:column}
 .zoom .zbar{display:flex;align-items:center;gap:8px;padding:10px 16px;color:#ececf1}
 .zoom .zbar b{margin-right:auto}
@@ -1051,7 +1053,9 @@ function winBody(a,w){
   if(w.type==='run')return{title:'명령 실행',status:null,body:h('pre',{},h('span',{class:'cmd'},'> '+(i.command||name)),'\n',pend?'실행 중…':d.result||'(출력 없음)')};
   if(w.type==='web'){
     const q=i.url||i.query||'';
-    return{title:(i.query?'검색':'웹 페이지')+' - 브라우저',addr:(i.query?'검색  ':'')+q,status:pend?'불러오는 중…':'완료',body:h('div',{class:'page'},pend?'불러오는 중…':d.result||'')};
+    const pageUrl=q||(String(d.result||'').match(/Page URL: (\S+)/)||[])[1]||'';
+    const shot=d.shot?h('img',{class:'webshot',alt:'브라우저 화면',src:`${S.conn.url}/api/agents/${a.id}/shot?m=${m.id}&t=${encodeURIComponent(S.conn.token)}`}):null;
+    return{title:(i.query?'검색':'웹 페이지')+' - 브라우저',addr:(i.query?'검색  ':'')+pageUrl,status:pend?'불러오는 중…':'완료',body:shot?h('div',{class:'page shotpage'},shot):h('div',{class:'page'},pend?'불러오는 중…':d.result||'')};
   }
   if(w.type==='find'){
     const lines=String(d.result||'').split('\n').filter(Boolean).slice(0,80);
