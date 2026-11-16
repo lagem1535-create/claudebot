@@ -3330,6 +3330,21 @@ fn handle(app: Arc<App>, mut req: Request) {
                     g.stopped.insert(id.to_string());
                 }
                 rc_stop(id);
+                // "작업 폴더도 지우기": 앱의 작업 폴더 안에 있고, 가져온 대화가 아니고, 다른 에이전트가 같이 쓰지 않는 폴더만 지웁니다.
+                if q.get("files").map_or(false, |v| v == "1") {
+                    if let Some(a) = g.s.agents.iter().find(|a| a.id == *id) {
+                        let dir = PathBuf::from(&a.dir);
+                        let shared = g.s.agents.iter().any(|o| o.id != a.id && o.dir == a.dir) || g.s.projects.iter().any(|p| PathBuf::from(&p.dir) == dir);
+                        if !a.imported && !shared && dir != app.work {
+                            if let (Ok(d), Ok(w)) = (dir.canonicalize(), app.work.canonicalize()) {
+                                if d.starts_with(&w) && d != w {
+                                    let _ = std::fs::remove_dir_all(&d);
+                                }
+                            }
+                        }
+                    }
+                }
+                let _ = std::fs::remove_dir_all(app.data.join("shots").join(*id));
                 g.s.agents.retain(|a| a.id != *id);
                 g.s.msgs.remove(*id);
                 g.senders.remove(*id);
